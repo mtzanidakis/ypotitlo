@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    # Dependabot commits carry long release-note bodies that trip
+    # body-max-line-length; its messages are machine-generated, so skip them.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: npm install --no-save @commitlint/cli @commitlint/config-conventional
+      # On the very first push to a branch github.event.before is all zeros,
+      # which commitlint cannot resolve; fall back to the single head commit.
+      - run: |
+          from="${{ github.event.pull_request.base.sha || github.event.before }}"
+          to="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ -z "$from" ] || [ "$from" = "0000000000000000000000000000000000000000" ]; then
+            npx commitlint --from "${to}~1" --to "$to" --verbose
+          else
+            npx commitlint --from "$from" --to "$to" --verbose
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+        with:
+          experimental: true
+      - run: mise run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+        with:
+          experimental: true
+      - run: go mod verify
+      - run: go vet ./...
+      - run: gofmt -l $(go list -f '{{.Dir}}' ./...) | tee gofmt.out && test ! -s gofmt.out
+      - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      # Guards the testability seams: no package may read the real home dir.
+      - run: mise run test-nohome
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4
+        with:
+          experimental: true
+      - run: mise run build

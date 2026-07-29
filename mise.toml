@@ -1,0 +1,31 @@
+[tools]
+go = "1.26.5"
+golangci-lint = "2.12.2"
+# node is only used by the commitlint task.
+node = "24"
+
+[tasks.build]
+run = "go build -ldflags \"-X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)\" ./cmd/..."
+
+[tasks.test]
+run = "go test -race -covermode=atomic ./..."
+
+# Proves the packages never touch the real home directory: every config path
+# must come from an injected seam, so the suite passes with no HOME at all.
+[tasks.test-nohome]
+run = "env HOME=/nonexistent XDG_CONFIG_HOME= XDG_DATA_HOME= go test ./..."
+
+[tasks.lint]
+run = "golangci-lint run ./..."
+
+[tasks.fmt]
+run = "gofmt -l -w cmd internal"
+
+[tasks.tidy]
+run = "go mod tidy"
+
+[tasks.verify]
+run = "go mod verify"
+
+[tasks.commitlint]
+run = "npx --yes --package @commitlint/cli --package @commitlint/config-conventional commitlint --last"

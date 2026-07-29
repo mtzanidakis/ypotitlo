@@ -1,0 +1,39 @@
+extends:
+  - "@commitlint/config-conventional"
+
+rules:
+  type-enum:
+    - 2
+    - always
+    - - feat
+      - fix
+      - refactor
+      - test
+      - chore
+      - docs
+      - ci
+      - build
+      - perf
+      - style
+
+  # Scopes mirror the internal/ package names plus the tooling areas.
+  scope-enum:
+    - 2
+    - always
+    - - srt
+      - charset
+      - lang
+      - config
+      - llm
+      - translate
+      - cli
+      - ci
+      - docs
+      - deps
+      - build
+
+  # Disabled: subjects routinely start with acronyms (SRT, BOM, LLM, UTF-8).
+  subject-case: [0]
+  subject-full-stop: [2, never, "."]
+  header-max-length: [2, always, 100]
+  body-max-line-length: [2, always, 100]

@@ -1,0 +1,51 @@
+version: 2
+
+project_name: ypotitlo
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: ypotitlo
+    main: ./cmd/ypotitlo
+    binary: ypotitlo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Stamps the same variable as mise's build task, so a local build and a
+    # release build report the version identically.
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: ypotitlo
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  # Drafted, not published, so the notes can be reviewed before they go out.
+  # Deliberately NOT mode: keep-existing -- that requires cutting the GitHub
+  # release by hand before pushing the tag, and there is no such process here yet.
+  draft: true

@@ -1,0 +1,41 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - gocritic
+    - revive
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+        - name: var-naming
+          disabled: true
+        - name: unexported-return
+          disabled: true
+        - name: blank-imports
+          disabled: true
+
+  # _test.go files are deliberately NOT excluded here. The fixture
+  # round-trips and byte comparisons in this repo are the most important code
+  # it contains, so they get linted like everything else.
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-same-issues: 0

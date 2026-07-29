@@ -1,0 +1,18 @@
+# Built binary
+/ypotitlo
+
+# Test / scratch subtitle files. Unit-test fixtures under testdata/ are tracked
+# deliberately — the whole test strategy is golden round-trip files.
+*.srt
+*.vtt
+*.ass
+*.ssa
+!**/testdata/**
+
+# Test & lint artifacts
+coverage.out
+gofmt.out
+
+# Local tooling overrides and secrets
+/mise.local.toml
+node_modules/

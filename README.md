@@ -156,9 +156,11 @@ summary says so. And thinking is charged as output: on a reasoning model the
 same subtitle file can cost ten times what it does on a plain one, which is why
 the summary reports output tokens separately.
 
-The other ceilings are a call fuse (`3 × batches + 10`) and `-timeout`, which
-default to 109 calls and 30 minutes for a typical film. Those still apply to
-unpriced models.
+The other ceilings still apply to unpriced models: a call fuse of
+`3 × batches + 10`, a two-hour `-timeout`, and a watchdog that gives up when
+nothing has advanced for six minutes. The timeout is sized for a long film —
+a 2h40m one is about a hundred batches and takes roughly fifty minutes — since
+exceeding it writes nothing, discarding work already paid for.
 
 ## Configuration
 

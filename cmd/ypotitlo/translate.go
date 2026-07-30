@@ -19,6 +19,17 @@ import (
 	"github.com/mtzanidakis/ypotitlo/internal/translate"
 )
 
+// defaultTimeout is the whole-run deadline.
+//
+// Sized from the longest realistic job rather than the typical one, because
+// exceeding it writes nothing at all: the work is done, paid for and then
+// discarded. A 2h40m film is 1,962 cues, which is 99 batches; at four concurrent
+// requests and the measured ~120 s per call that is about fifty minutes, and the
+// previous half-hour default cut it off halfway through. Being generous costs
+// nothing on a run that finishes early, and the stall watchdog and circuit
+// breaker are what actually catch a run that has stopped working.
+const defaultTimeout = 2 * time.Hour
+
 // stdinPath is the conventional sentinel for "read from stdin" / "write to
 // stdout". It is a legitimate value for -i and -o and must survive the check
 // that rejects flag-looking values.
@@ -73,7 +84,7 @@ func cmdTranslate(ctx context.Context, e env, args []string) error {
 	fs.IntVar(&f.concurrency, "j", 0, "concurrent requests")
 	fs.IntVar(&f.batchSize, "b", 0, "cues per request")
 	fs.Float64Var(&f.budget, "budget", 0, "spend ceiling for this run, in USD")
-	fs.DurationVar(&f.timeout, "timeout", 30*time.Minute, "overall deadline")
+	fs.DurationVar(&f.timeout, "timeout", defaultTimeout, "overall deadline")
 	fs.BoolVar(&f.dryRun, "n", false, "report what would happen and make no API calls")
 	fs.BoolVar(&f.force, "f", false, "overwrite an existing output file")
 	fs.BoolVar(&f.quiet, "q", false, "suppress progress")
@@ -619,7 +630,7 @@ func translateUsage(w io.Writer) {
 				{"-b N", "cues per request"},
 				{"-j N", "concurrent requests"},
 				{"-budget USD", "spend ceiling for this run"},
-				{"-timeout D", "overall deadline, e.g. 30m"},
+				{"-timeout D", "overall deadline (default 2h)"},
 				{"-no-brief", "skip the whole-file consistency pass"},
 			}},
 			{Title: "Reporting", Flags: []flagDoc{

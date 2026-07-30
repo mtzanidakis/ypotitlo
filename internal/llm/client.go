@@ -123,9 +123,21 @@ const DefaultRequestTimeout = 4 * time.Minute
 // only itself, and the client's own Timeout bounds it.
 func newTransport() http.RoundTripper {
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	// A non-nil empty map is the documented way to refuse the h2 upgrade.
+
+	// Three things are needed, and two of them alone are a trap. Clearing
+	// TLSNextProto stops the transport *handling* h2, but ALPN still offers it,
+	// so a server that prefers h2 selects it and then answers in a protocol
+	// this transport will not parse — the symptom is
+	// `malformed HTTP response "\x00\x00\x12\x04..."`, which is an HTTP/2
+	// SETTINGS frame read as a status line. NextProtos has to say http/1.1 too.
 	t.ForceAttemptHTTP2 = false
 	t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		t.TLSClientConfig = t.TLSClientConfig.Clone()
+	}
+	t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return t
 }
 

@@ -187,7 +187,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 
 	// Warnings go through the UI so they never land on top of the spinner.
 	warn := func(format string, a ...any) {
-		ui.Suspend(func() { warnf(e, format, a...) })
+		ui.SuspendWarn(func() { warnf(e, format, a...) })
 	}
 
 	opts := translate.Options{
@@ -218,6 +218,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		return err
 	}
 	opts.Source = source
+	ui.EndPhase()
 
 	// One line naming both ends of the translation, so a mistaken target is
 	// obvious at a glance rather than only after the file is written. It always
@@ -252,7 +253,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	file.Cues = res.Cues
 
 	elapsed := ui.Elapsed()
-	ui.Stop()
+	ui.Complete()
 
 	if err := writeOutput(e, file, f, outPath); err != nil {
 		return err

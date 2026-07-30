@@ -14,6 +14,14 @@ var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 const spinnerInterval = 100 * time.Millisecond
 
+// Marks left behind when a phase ends. A phase during which something was
+// warned about gets the second one: a tick above a warning line would be
+// contradicting it.
+const (
+	markDone = "✓"
+	markWarn = "!"
+)
+
 // progressUI draws a single self-updating status line: what the run is doing
 // now, how long it has been going, and — once there is enough evidence to say —
 // how much longer it will take.
@@ -36,6 +44,7 @@ type progressUI struct {
 	started  time.Time // whole run
 	phaseAt  time.Time // current phase, for the ETA
 	lastLine int       // width of what was drawn, so it can be erased
+	warned   bool      // something was warned about during this phase
 	stopped  bool
 
 	stop chan struct{}
@@ -84,10 +93,48 @@ func (p *progressUI) Start() {
 func (p *progressUI) Phase(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Reaching a new phase means the previous one ended, so it is left on the
+	// screen with how long it took instead of being overwritten in place.
+	p.finish()
+
 	p.phase = name
 	p.phaseAt = p.now()
 	p.done, p.total = 0, 0
+	p.warned = false
 	p.draw()
+}
+
+// Complete ends the current phase successfully and stops the display. Used on
+// the path where the run produced a file; Stop alone leaves no mark, which is
+// what a failed run wants.
+func (p *progressUI) Complete() {
+	p.mu.Lock()
+	p.finish()
+	p.mu.Unlock()
+	p.Stop()
+}
+
+// finish leaves a completed phase on its own line. Caller holds the lock.
+func (p *progressUI) finish() {
+	if !p.enabled || p.phase == "" {
+		return
+	}
+	p.erase()
+
+	mark := markDone
+	if p.warned {
+		mark = markWarn
+	}
+	line := mark + " " + p.phase
+	if p.total > 0 {
+		line += fmt.Sprintf(" %d/%d", p.done, p.total)
+	}
+	line += " · " + clock(p.now().Sub(p.phaseAt))
+	_, _ = fmt.Fprintf(p.w, "%s\n", line)
+
+	p.phase = ""
+	p.lastLine = 0
 }
 
 // Progress updates the cue counter that drives the ETA.
@@ -111,6 +158,25 @@ func (p *progressUI) Suspend(f func()) {
 	defer p.mu.Unlock()
 	p.erase()
 	f()
+}
+
+// SuspendWarn is Suspend for output that reports a problem. It also marks the
+// current phase, so the line it eventually leaves behind does not claim success
+// directly above a warning explaining what went wrong.
+func (p *progressUI) SuspendWarn(f func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.erase()
+	p.warned = true
+	f()
+}
+
+// EndPhase closes the current phase without opening another, so a caller can
+// print something between two phases and have it appear in order.
+func (p *progressUI) EndPhase() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.finish()
 }
 
 // Stop ends the animation and clears the line. Safe to call twice.

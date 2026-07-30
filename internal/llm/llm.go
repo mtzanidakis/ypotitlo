@@ -27,6 +27,11 @@ var (
 	ErrAuth = errors.New("llm: authentication failed")
 	// ErrCreditExhausted indicates a provider 402/403 (quota/credit) response.
 	ErrCreditExhausted = errors.New("llm: credit/quota exhausted")
+	// ErrRateLimited indicates the provider's retry budget for 429 was spent.
+	// It is distinct from a transport failure because it means the opposite: the
+	// provider is answering, and asking to be asked less often. A caller's
+	// circuit breaker must not count it as evidence of an outage.
+	ErrRateLimited = errors.New("llm: rate limited")
 	// ErrNoContent indicates the model returned an empty completion.
 	ErrNoContent = errors.New("llm: empty completion")
 	// ErrTruncated indicates the model hit max_tokens (finish_reason=length).

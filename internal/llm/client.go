@@ -334,6 +334,13 @@ retry:
 	if lastErr == nil {
 		lastErr = errors.New("llm: request failed")
 	}
+	// A run that spent its 429 budget was throttled, not disconnected. The
+	// distinction matters to a caller's circuit breaker: the provider is
+	// answering, and asking to be asked less often.
+	var re *retryableError
+	if errors.As(lastErr, &re) && re.code == http.StatusTooManyRequests {
+		return nil, retries, fmt.Errorf("%w after %d retries: %w", ErrRateLimited, retries, lastErr)
+	}
 	return nil, retries, fmt.Errorf("llm: request failed after %d retries: %w", retries, lastErr)
 }
 

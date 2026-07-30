@@ -44,6 +44,20 @@ const (
 	// a third level would be diagnosing a broken model rather than a long reply.
 	maxSplitDepth = 2
 
+	// maxConsecutiveFailures aborts a run whose calls have all stopped working.
+	// Set above the retries a single flaky batch can legitimately produce, and
+	// far below the number of batches in a film, so a real outage is caught in
+	// seconds rather than after every batch has failed in turn.
+	maxConsecutiveFailures = 5
+
+	// defaultMaxUntranslated is the share of cues that may keep their original
+	// text before the run is called a failure rather than a translation.
+	defaultMaxUntranslated = 0.5
+
+	// minCuesForRatioCheck is the size below which that share proves nothing:
+	// one honest fallback in a three-cue file is already a third of it.
+	minCuesForRatioCheck = 10
+
 	// truncationScale is how much the output ceiling is raised when a reply
 	// comes back cut off. It is deliberately a large step rather than a
 	// doubling: the shortfall is usually a reasoning model's thinking budget,
@@ -71,6 +85,13 @@ const (
 // buy is a larger bill.
 var ErrCallBudget = errors.New("translate: call budget exhausted")
 
+// ErrProviderUnreachable is returned when calls stop working altogether.
+var ErrProviderUnreachable = errors.New("translate: the provider is not answering")
+
+// ErrMostlyUntranslated is returned when so few cues came back that the result
+// is not a translation.
+var ErrMostlyUntranslated = errors.New("translate: too much of the file came back untranslated")
+
 // Options configures a run.
 type Options struct {
 	Provider llm.Provider
@@ -89,6 +110,10 @@ type Options struct {
 	// 3*ceil(cues/BatchSize)+10, which covers a brief, one repair per batch and
 	// a couple of splits.
 	MaxCalls int
+
+	// MaxUntranslatedRatio is the share of cues that may keep their original
+	// text before Run reports failure instead of a result. 0 means 0.5.
+	MaxUntranslatedRatio float64
 
 	// Brief enables pass 0 (see brief.go). Note that the zero value is false:
 	// callers that want the brief must ask for it. The command line asks for it
@@ -173,12 +198,32 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 		return Result{Stats: r.snapshot(), Warnings: r.warningList(), Brief: brief}, err
 	}
 
-	return Result{
+	res := Result{
 		Cues:     r.assemble(cues),
 		Brief:    brief,
 		Stats:    r.snapshot(),
 		Warnings: r.warningList(),
-	}, nil
+	}
+
+	// Keeping a handful of cues in the source language is the documented
+	// fallback. Keeping most of them is not a translation, and returning one as
+	// a success is how a broken run ends up written to disk and shipped: every
+	// individual failure was warned about, so nothing looked wrong.
+	//
+	// The floor matters. On a three-cue file one legitimate fallback is already
+	// a third of the file, which says nothing about whether the run worked; the
+	// ratio only becomes evidence once there are enough cues to average over.
+	limit := r.o.MaxUntranslatedRatio
+	if limit <= 0 {
+		limit = defaultMaxUntranslated
+	}
+	if len(cues) >= minCuesForRatioCheck {
+		if ratio := float64(res.Stats.Untranslated) / float64(len(cues)); ratio > limit {
+			return res, fmt.Errorf("%w: %d of %d cues (%.0f%%)",
+				ErrMostlyUntranslated, res.Stats.Untranslated, len(cues), ratio*100)
+		}
+	}
+	return res, nil
 }
 
 // runner holds the mutable state of one run.
@@ -196,6 +241,10 @@ type runner struct {
 	stats    Stats
 	warnings []string
 	done     int
+
+	// consecutiveFailures drives the circuit breaker; see trip.
+	consecutiveFailures int
+	lastFailure         error
 }
 
 // nextSeed draws the sampling seed for one call.
@@ -302,7 +351,40 @@ func (r *runner) call(ctx context.Context, req llm.Request) (llm.Response, error
 	}
 	resp, err := r.o.Provider.Complete(ctx, req)
 	r.record(resp)
+	if err := r.trip(err); err != nil {
+		return resp, err
+	}
 	return resp, err
+}
+
+// trip is the circuit breaker: it aborts the run once calls stop working
+// altogether, instead of letting every batch fail politely.
+//
+// Without it, a provider that cannot be reached at all is indistinguishable
+// from a successful run. Each batch fails, each failure is warned about, each
+// cue quietly keeps its original text, and the command exits 0 having written a
+// file in the source language. That happened during a DNS outage: the run spent
+// twenty-five minutes failing and would have reported success.
+//
+// A truncated reply is deliberately not counted. It is a handled condition with
+// its own remedy — raise the ceiling, then split — and the call fuse already
+// bounds the case where that never converges.
+func (r *runner) trip(err error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err == nil || errors.Is(err, llm.ErrTruncated) {
+		r.consecutiveFailures = 0
+		return nil
+	}
+
+	r.consecutiveFailures++
+	r.lastFailure = err
+	if r.consecutiveFailures < maxConsecutiveFailures {
+		return nil
+	}
+	return fmt.Errorf("%w after %d consecutive failures: %w",
+		ErrProviderUnreachable, r.consecutiveFailures, r.lastFailure)
 }
 
 // guarded is the runner's provider seen as an llm.Provider, so that helpers
@@ -698,6 +780,9 @@ func isFatal(err error) bool {
 	return errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, ErrCallBudget) ||
+		// The breaker only trips once calls have stopped working entirely, so
+		// carrying on would just fail every remaining batch in turn.
+		errors.Is(err, ErrProviderUnreachable) ||
 		errors.Is(err, llm.ErrAuth) ||
 		errors.Is(err, llm.ErrCreditExhausted) ||
 		errors.Is(err, llm.ErrBudgetExceeded)

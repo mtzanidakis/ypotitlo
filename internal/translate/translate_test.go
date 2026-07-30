@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mtzanidakis/ypotitlo/internal/llm"
@@ -933,5 +934,101 @@ func TestGuardedProviderName(t *testing.T) {
 	r := newRunner(opts(echoing(prefix("EL:")), &warns))
 	if got := (guarded{r}).Name(); got != "fake" {
 		t.Errorf("Name = %q, want %q", got, "fake")
+	}
+}
+
+// TestRunAbortsWhenTheProviderStopsAnswering pins the behaviour that a DNS
+// outage exposed. Every batch failed, every failure was warned about, every cue
+// quietly kept its source text, and the run would have exited successfully
+// having written an untranslated file. A run that cannot reach the provider
+// must fail, not degrade.
+func TestRunAbortsWhenTheProviderStopsAnswering(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(200)
+	var calls atomic.Int32
+	p := &fakeProvider{fn: func(_ llm.Request, _ int) (llm.Response, error) {
+		calls.Add(1)
+		return llm.Response{}, fmt.Errorf("dial tcp: lookup opencode.ai: no such host")
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	_, err := Run(context.Background(), in, o)
+
+	if !errors.Is(err, ErrProviderUnreachable) {
+		t.Fatalf("Run error = %v, want ErrProviderUnreachable", err)
+	}
+	// It must give up quickly rather than working through every batch.
+	if n := calls.Load(); n > maxConsecutiveFailures*3 {
+		t.Errorf("made %d calls before giving up; the breaker should trip near %d",
+			n, maxConsecutiveFailures)
+	}
+}
+
+// A single failing batch must not trip the breaker: the counter resets on any
+// call that works.
+func TestRunToleratesIsolatedFailures(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(60)
+	var n atomic.Int32
+	p := &fakeProvider{fn: func(req llm.Request, _ int) (llm.Response, error) {
+		// Fail every third call, succeed otherwise.
+		if n.Add(1)%3 == 0 {
+			return llm.Response{}, fmt.Errorf("transient")
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+}
+
+// TestRunRejectsAMostlyUntranslatedResult covers the other half of the same
+// problem: calls that succeed but return nothing usable.
+func TestRunRejectsAMostlyUntranslatedResult(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(40)
+	p := &fakeProvider{fn: func(_ llm.Request, _ int) (llm.Response, error) {
+		// Well-formed, entirely useless: no cue objects at all.
+		return llm.Response{Content: "I am unable to help with that."}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	res, err := Run(context.Background(), in, o)
+
+	if !errors.Is(err, ErrMostlyUntranslated) {
+		t.Fatalf("Run error = %v, want ErrMostlyUntranslated", err)
+	}
+	// The cues still come back intact so a caller can inspect them.
+	assertShape(t, in, res.Cues)
+}
+
+// A small file is exempt: one honest fallback in a three-cue file is a third of
+// it and says nothing about whether the run worked.
+func TestSmallFilesAreExemptFromTheRatioCheck(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(3)
+	p := &fakeProvider{fn: func(_ llm.Request, _ int) (llm.Response, error) {
+		return llm.Response{Content: "no objects here"}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	if _, err := Run(context.Background(), in, o); err != nil {
+		t.Fatalf("a %d-cue file must not trip the ratio check: %v", len(in), err)
 	}
 }

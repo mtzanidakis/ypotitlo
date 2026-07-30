@@ -157,6 +157,12 @@ type Options struct {
 	// text before Run reports failure instead of a result. 0 means 0.5.
 	MaxUntranslatedRatio float64
 
+	// PreparedBrief skips pass 0 and uses this instead. A caller that cached a
+	// brief from an earlier attempt passes it here; the brief describes the film,
+	// not the attempt, so recomputing it on a resume buys nothing and costs a
+	// minute and fifteen thousand tokens.
+	PreparedBrief *Brief
+
 	// BriefCues is the dialogue pass 0 reads, when it should differ from the
 	// cues being translated. Resuming a partial file translates only the cues
 	// that are still missing, and a brief drawn from those alone would describe
@@ -268,6 +274,11 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 	// the entire stall budget and the watchdog failed the run, which is the
 	// opposite of "continuing without it": an otherwise healthy translation died
 	// in a phase it did not need.
+	if o.PreparedBrief != nil {
+		r.sys = systemPrompt(o.Source, o.Target, o.PreparedBrief)
+		return r.translateAll(ctx, cues, o.PreparedBrief)
+	}
+
 	r.phase("brief")
 	briefCtx, cancelBrief := context.WithTimeout(ctx, r.briefDeadline())
 	briefCues := cues
@@ -294,7 +305,12 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 		return Result{Stats: r.snapshot(), Warnings: r.warningList()}, err
 	}
 	r.sys = systemPrompt(o.Source, o.Target, brief)
+	return r.translateAll(ctx, cues, brief)
+}
 
+// translateAll runs the batch phase. Split out so a caller supplying a cached
+// brief reaches it without going through pass 0.
+func (r *runner) translateAll(ctx context.Context, cues []srt.Cue, brief *Brief) (Result, error) {
 	ranges := planBatches(cues, r.o.BatchSize)
 	r.stats.Batches = len(ranges)
 	r.phase("translating")

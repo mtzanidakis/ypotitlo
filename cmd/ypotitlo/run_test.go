@@ -323,3 +323,63 @@ func TestCancelledContextReportsNoOutputWritten(t *testing.T) {
 		t.Errorf("stderr = %q", errb)
 	}
 }
+
+// TestNormalizeVersion pins the prefix rule. Tags in this repo carry a leading
+// v; goreleaser's asset names and its ldflags value do not, so the same build
+// could otherwise report "0.1.0" while the tag says "v0.1.0".
+func TestNormalizeVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ in, want string }{
+		{"0.1.0", "v0.1.0"},
+		{"v0.1.0", "v0.1.0"},
+		{" 0.2.3 ", "v0.2.3"},
+		{"0.1.0-3-gabc1234", "v0.1.0-3-gabc1234"},
+		{"dev", "dev"},
+		{"", ""},
+		{"(devel)", "(devel)"},
+	}
+	for _, tt := range tests {
+		if got := normalizeVersion(tt.in); got != tt.want {
+			t.Errorf("normalizeVersion(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// A local build has neither an ldflags stamp nor a module version, and must say
+// so rather than inventing one.
+func TestResolveVersionFallsBackToDev(t *testing.T) {
+	t.Parallel()
+
+	if got := resolveVersion(); got != devVersion {
+		// Under `go test` the build info records "(devel)", so this is the
+		// honest answer; a stamped binary is covered by the release check.
+		t.Errorf("resolveVersion() = %q, want %q for an unstamped test binary", got, devVersion)
+	}
+}
+
+func TestVersionCommandPrintsTheResolvedVersion(t *testing.T) {
+	t.Parallel()
+
+	e, out, errb := testEnv(t, []string{"version"}, nil)
+	if got := run(context.Background(), e); got != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", got, errb)
+	}
+	if strings.TrimSpace(out.String()) != resolveVersion() {
+		t.Errorf("stdout = %q, want %q", out.String(), resolveVersion())
+	}
+}
+
+func TestUpgradeHelp(t *testing.T) {
+	t.Parallel()
+
+	e, out, errb := testEnv(t, []string{"upgrade", "-h"}, nil)
+	if got := run(context.Background(), e); got != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", got, errb)
+	}
+	for _, want := range []string{"checksum", "-n", "-repo"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("upgrade help missing %q:\n%s", want, out)
+		}
+	}
+}

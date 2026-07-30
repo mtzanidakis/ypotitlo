@@ -98,13 +98,14 @@ func commands() map[string]command {
 		"config-show":  {cmdConfigShow, "Show the effective config and where each value came from"},
 		"config-set":   {cmdConfigSet, "Set a configuration value"},
 		"config-unset": {cmdConfigUnset, "Remove a configuration value"},
+		"upgrade":      {cmdUpgrade, "Replace this binary with the newest release"},
 		"version":      {cmdVersion, "Print the ypotitlo version"},
 	}
 }
 
 // order is the order subcommands are listed in the usage text; it is
 // deliberately by workflow rather than alphabetical.
-var order = []string{"translate", "list-models", "config-show", "config-set", "config-unset", "version"}
+var order = []string{"translate", "list-models", "config-show", "config-set", "config-unset", "upgrade", "version"}
 
 func run(ctx context.Context, e env) int {
 	if len(e.Args) == 0 {
@@ -177,6 +178,6 @@ func cmdVersion(_ context.Context, e env, args []string) error {
 	if len(args) > 0 {
 		return usagef("version takes no arguments, got %q", args[0])
 	}
-	outf(e.Stdout, "%s\n", version)
+	outf(e.Stdout, "%s\n", resolveVersion())
 	return nil
 }

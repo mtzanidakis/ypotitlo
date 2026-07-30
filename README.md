@@ -17,6 +17,17 @@ ypotitlo translate -i movie.en.srt -ol greek
 go install github.com/mtzanidakis/ypotitlo/cmd/ypotitlo@latest
 ```
 
+Or download a binary from the [latest release](https://github.com/mtzanidakis/ypotitlo/releases/latest)
+and put it on your `PATH`. Either way, later versions install themselves:
+
+```
+ypotitlo upgrade        # -n to see what it would do first
+```
+
+The archive's checksum is verified against the release's `checksums.txt` before
+anything is replaced, and the swap is atomic — a failure at any point leaves the
+working binary in place.
+
 ## Getting started
 
 ```sh
@@ -49,6 +60,7 @@ ypotitlo translate -i movie.en.srt -ol greek
 | `config-show` | Show the effective config and where each value came from |
 | `config-set` | Set a configuration value |
 | `config-unset` | Remove a configuration value |
+| `upgrade` | Replace this binary with the newest release |
 | `version` | Print the version |
 
 Run `ypotitlo <command> -h` for a command's flags.

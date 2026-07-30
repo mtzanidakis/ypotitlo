@@ -122,6 +122,16 @@ counter-intuitive, say what would have gone wrong otherwise.
 Each phase of work ends with a green `mise run lint && mise run test` and one
 commit. Verify a message with `mise run commitlint`.
 
+## Versions
+
+`main.version` is stamped by the linker in release builds, but `go install` passes
+no ldflags, so a binary installed that way would report `dev` despite coming from
+a tagged module. `resolveVersion` therefore prefers the stamped value and falls
+back to the module version in `runtime/debug.ReadBuildInfo`, normalising both to a
+leading `v`. Keep those two sources in agreement if either changes: `upgrade`
+compares the reported version against the latest release tag, so a version that
+lies makes it either refuse a real upgrade or attempt a pointless one.
+
 ## Releasing
 
 Push a `v*` tag. `release.yml` gates GoReleaser behind lint and tests, and

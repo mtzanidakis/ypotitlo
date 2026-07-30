@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -175,7 +176,8 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		return writeOutput(e, file, f, outPath)
 	}
 
-	provider, keySource, err := buildProvider(cfg, f, e)
+	heartbeat := translate.NewHeartbeat(e.Now)
+	provider, keySource, err := buildProvider(cfg, f, e, heartbeat.Beat)
 	if err != nil && !f.dryRun {
 		return err
 	}
@@ -196,6 +198,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		Target:      target,
 		BatchSize:   cfg.BatchSize,
 		Concurrency: cfg.Concurrency,
+		Heartbeat:   heartbeat,
 		Brief:       !f.noBrief,
 		Rand:        rand.New(rand.NewSource(e.Now().UnixNano())),
 		Warn:        warn,
@@ -247,12 +250,25 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	// ---- translate --------------------------------------------------------
 	res, err := translate.Run(ctx, file.Cues, opts)
 	if err != nil {
-		// A failed run has usually already spent something. Reporting the error
-		// without the accounting leaves no way to tell a run that failed on its
-		// first call from one that failed after forty.
 		failed := ui.Elapsed()
 		ui.Stop()
 		writeSpend(e, res.Stats, failed, f)
+
+		// Keep whatever was translated before the failure. The result is a
+		// complete, valid subtitle file with some cues still in the source
+		// language — the same fallback an individual cue gets — and throwing it
+		// away means an hour of work and the money that bought it are lost to
+		// spare the user a file they would rather have had. The error still
+		// stands and the exit code still reports it.
+		if n := translatedCount(file.Cues, res.Cues); n > 0 {
+			file.Cues = res.Cues
+			if werr := writeOutput(e, file, f, outPath); werr != nil {
+				warnf(e, "could not save the partial translation: %v", werr)
+			} else {
+				outf(e.Stderr, "saved %s with %d of %d cues translated\n",
+					displayPath(outPath), n, len(res.Cues))
+			}
+		}
 		return classifyRunError(err, keySource)
 	}
 	file.Cues = res.Cues
@@ -410,7 +426,7 @@ func resolveSource(ctx context.Context, e env, cues []srt.Cue, f translateFlags,
 	return l, provenance, nil
 }
 
-func buildProvider(cfg config.Config, f translateFlags, e env) (llm.Provider, string, error) {
+func buildProvider(cfg config.Config, f translateFlags, e env, onAttempt func()) (llm.Provider, string, error) {
 	o := configOptions(e, f.configPath)
 	key, keySource, err := config.ResolveAPIKey(o, cfg, f.apiKey)
 	if err != nil {
@@ -430,6 +446,7 @@ func buildProvider(cfg config.Config, f translateFlags, e env) (llm.Provider, st
 		BaseURL:   cfg.BaseURL,
 		Budget:    budget,
 		Now:       e.Now,
+		OnAttempt: onAttempt,
 	}), keySource, nil
 }
 
@@ -650,6 +667,21 @@ func translateUsage(w io.Writer) {
 			"ypotitlo translate -i movie.srt -il en -ol el -o out.srt",
 			"ypotitlo translate -i movie.en.srt -ol el -n",
 		})
+}
+
+// translatedCount is how many cues actually changed, which is the only
+// meaningful measure of whether a failed run produced anything worth keeping.
+func translatedCount(before, after []srt.Cue) int {
+	if len(after) != len(before) {
+		return 0
+	}
+	n := 0
+	for i := range after {
+		if !slices.Equal(after[i].Lines, before[i].Lines) {
+			n++
+		}
+	}
+	return n
 }
 
 // writeSpend reports what a run cost when it did not produce a file. Nothing is

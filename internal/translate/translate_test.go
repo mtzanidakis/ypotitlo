@@ -538,8 +538,15 @@ func TestRunCallBudgetFuse(t *testing.T) {
 	if !errors.Is(err, ErrCallBudget) {
 		t.Fatalf("err = %v, want ErrCallBudget", err)
 	}
-	if res.Cues != nil {
-		t.Errorf("cues = %v, want nil on a fatal error", res.Cues)
+	// The work done before the fuse blew is still returned. A run that fails
+	// partway has produced a complete, valid file with some cues left in the
+	// source language, and discarding it throws away everything already paid for.
+	assertShape(t, in, res.Cues)
+	if res.Cues[0].Lines[0] != "EL:line 1" {
+		t.Errorf("cue 1 = %q, want the translation that succeeded before the fuse", res.Cues[0].Lines[0])
+	}
+	if res.Cues[len(res.Cues)-1].Lines[0] != "line 6" {
+		t.Errorf("cue 6 = %q, want the untouched original", res.Cues[len(res.Cues)-1].Lines[0])
 	}
 	if p.count() != 2 {
 		t.Errorf("provider calls = %d, want 2", p.count())
@@ -1260,5 +1267,104 @@ func TestStallTimeoutIsClampedAboveTheBriefDeadline(t *testing.T) {
 	// The brief's deadline must fit inside the effective stall budget.
 	if got := r.effectiveStallTimeout(); got <= briefTimeout {
 		t.Errorf("effective stall timeout = %v, must exceed briefTimeout %v", got, briefTimeout)
+	}
+}
+
+// A call that is retrying internally must not look like a hung one.
+//
+// The watchdog could previously see only a call returning, and one call retries
+// several times over several minutes against a provider answering 503. A real
+// run died that way: it had translated 95% of a file, spent 54 minutes and
+// $0.22, and was killed while its last calls were legitimately in flight.
+func TestHeartbeatKeepsARetryingCallAlive(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clockFn := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	hb := NewHeartbeat(clockFn)
+
+	// One "call" that internally takes far longer than the stall budget, beating
+	// once per attempt the way the client does.
+	p := &fakeProvider{fn: func(req llm.Request, n int) (llm.Response, error) {
+		if n == 1 {
+			for range 6 {
+				advance(90 * time.Second) // 9 minutes total, past the 2-minute budget
+				hb.Beat()
+			}
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Concurrency = 1
+	o.Heartbeat = hb
+	o.Now = clockFn
+	o.StallTimeout = 2 * time.Minute
+
+	in := makeCues(20)
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("a retrying call was mistaken for a hung one: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+}
+
+// Without beats, the same silence is still caught — the heartbeat must not
+// disable the watchdog, only inform it.
+func TestSilenceIsStillCaughtWithAHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clockFn := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+
+	hb := NewHeartbeat(clockFn)
+	p := &fakeProvider{fnCtx: func(ctx context.Context, _ llm.Request, _ int) (llm.Response, error) {
+		<-ctx.Done() // hangs, and never beats
+		return llm.Response{}, ctx.Err()
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Heartbeat = hb
+	o.Now = clockFn
+	o.StallTimeout = time.Minute
+
+	done := make(chan error, 1)
+	go func() { _, err := Run(context.Background(), makeCues(40), o); done <- err }()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrStalled) {
+				t.Fatalf("err = %v, want ErrStalled", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("a silent run was not caught; the heartbeat must not disable the watchdog")
+		default:
+			mu.Lock()
+			now = now.Add(30 * time.Second)
+			mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
+// A nil Heartbeat is the ordinary case for a caller that has not wired one.
+func TestNilHeartbeatIsSafe(t *testing.T) {
+	t.Parallel()
+
+	var hb *Heartbeat
+	hb.Beat() // must not panic
+	if !hb.Last().IsZero() {
+		t.Error("a nil heartbeat should report no beats")
 	}
 }

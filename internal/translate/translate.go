@@ -136,6 +136,11 @@ type Options struct {
 	// a couple of splits.
 	MaxCalls int
 
+	// Heartbeat, when supplied, lets the stall watchdog see individual HTTP
+	// attempts rather than only completed calls. Wire it to the client's
+	// OnAttempt; see the Heartbeat doc for why the distinction matters.
+	Heartbeat *Heartbeat
+
 	// StallTimeout aborts the run when nothing has advanced within it.
 	// 0 means defaultStallTimeout.
 	StallTimeout time.Duration
@@ -202,7 +207,9 @@ type Stats struct {
 // Result is the outcome of a run.
 type Result struct {
 	// Cues has the same length and order as the input, with Start, End and
-	// Index untouched. On error it is nil.
+	// Index untouched. It is populated even when Run returns an error, as long
+	// as the run got far enough to translate anything: a partly translated file
+	// is still a usable one, and the caller decides whether to keep it.
 	Cues     []srt.Cue
 	Brief    *Brief
 	Stats    Stats
@@ -282,7 +289,18 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 	r.phase("translating")
 
 	if err := r.work(ctx, cues, ranges); err != nil {
-		return Result{Stats: r.snapshot(), Warnings: r.warningList(), Brief: brief}, err
+		// The cues are assembled even here. Whatever finished before the failure
+		// is a complete, valid subtitle file with some cues still in the source
+		// language — which is the documented fallback, not corruption. Discarding
+		// it meant a run that failed at 95% threw away an hour of work and the
+		// money that bought it, to save the caller from a file it would have been
+		// glad to have.
+		return Result{
+			Cues:     r.assemble(cues),
+			Brief:    brief,
+			Stats:    r.snapshot(),
+			Warnings: r.warningList(),
+		}, err
 	}
 
 	res := Result{
@@ -513,13 +531,12 @@ func (r *runner) call(ctx context.Context, req llm.Request) (llm.Response, error
 	resp, err := r.o.Provider.Complete(ctx, req)
 	r.record(resp)
 
-	// A call that came back at all is proof the provider is answering, which is
-	// the only thing the watchdog exists to detect. Resetting on batch
-	// completion instead was too coarse: one batch is up to four sequential
-	// calls, and one call is up to six HTTP attempts with backoff — a provider
-	// answering 429 with Retry-After: 60 five times spends five minutes inside a
-	// single call that ultimately succeeds, and the watchdog would kill the run
-	// and blame a silent connection.
+	// The client also reports each HTTP attempt through Options.OnAttempt, which
+	// is what actually keeps the watchdog honest: one Complete spans several
+	// attempts and can legitimately run for twelve minutes against a provider
+	// returning 503s, so waiting for it to return is not enough to tell a
+	// retrying call from a hung one. This marks the outer boundary; the hook
+	// marks everything inside it.
 	r.markProgress()
 
 	if err := r.trip(err); err != nil {
@@ -639,8 +656,15 @@ func (r *runner) effectiveStallTimeout() time.Duration {
 // idleFor is how long it has been since the run last advanced.
 func (r *runner) idleFor() time.Duration {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.clock().Sub(r.lastProgress)
+	last := r.lastProgress
+	r.mu.Unlock()
+
+	// An HTTP attempt is finer-grained evidence than a completed call, so the
+	// most recent of the two is what "idle" has to mean.
+	if beat := r.o.Heartbeat.Last(); beat.After(last) {
+		last = beat
+	}
+	return r.clock().Sub(last)
 }
 
 // markProgress restarts the watchdog's clock.

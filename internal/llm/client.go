@@ -25,13 +25,19 @@ type TokenPrice struct {
 }
 
 // Retry budgets, kept per failure class rather than as one number. A 429 is the
-// provider asking us to slow down and is worth waiting out; a 5xx or a
-// transport error is a fault we cannot influence, so we give up early instead
-// of hammering a broken endpoint. The two budgets are spent independently, so a
-// run that trips one still has the other.
+// provider asking us to slow down and is worth waiting out. The two budgets are
+// spent independently, so a run that trips one still has the other.
+//
+// The 5xx budget was 2, on the reasoning that a fault we cannot influence is not
+// worth hammering. That reasoning was wrong for this provider: a real run met
+// six separate "Inference is temporarily unavailable" responses, and every batch
+// that exhausted its two retries lost twenty-one cues to the fallback while the
+// service recovered moments later. Transient upstream unavailability is exactly
+// what retries are for, and the backoff is jittered, so waiting longer costs
+// little and saves the batch.
 const (
 	defaultRetries429   = 5
-	defaultRetriesOther = 2
+	defaultRetriesOther = 5
 )
 
 // Backoff window. Full jitter picks uniformly from [0, min(cap, base·2^attempt)).
@@ -58,6 +64,7 @@ type Client struct {
 	tryJSONSchema bool // send response_format=json_schema first (false for OpenCode Zen)
 	prices        map[string]TokenPrice
 	extraHeaders  map[string]string
+	onAttempt     func()
 
 	// rand is guarded: math/rand.Rand is not safe for concurrent use and one
 	// client is shared by every translate worker.
@@ -91,6 +98,13 @@ type Config struct {
 	// RequestTimeout bounds one HTTP exchange. 0 means DefaultRequestTimeout.
 	// Ignored when HTTP is supplied.
 	RequestTimeout time.Duration
+
+	// OnAttempt is called after every HTTP exchange, successful or not, before
+	// any backoff. It exists so a caller watching for a stalled run can see
+	// inside a call: one Complete can span several attempts and several minutes,
+	// and a watchdog that only observes the call returning cannot tell a request
+	// that is being retried from one that has hung.
+	OnAttempt func()
 
 	// Retries429 and RetriesOther override the per-class retry budgets.
 	Retries429   int
@@ -176,7 +190,7 @@ func NewClient(cfg Config) *Client {
 		hc: hc, retries429: retries429, retriesOther: retriesOther,
 		budget: cfg.Budget, now: now, sleep: sleep, rand: rnd,
 		reportsCost: cfg.ReportsCost, tryJSONSchema: cfg.TryJSONSchema, prices: cfg.Prices,
-		extraHeaders: cfg.ExtraHeaders,
+		extraHeaders: cfg.ExtraHeaders, onAttempt: cfg.OnAttempt,
 	}
 }
 
@@ -299,6 +313,7 @@ retry:
 		}
 
 		resp, err := c.hc.Do(httpReq)
+		c.attempted()
 		if err != nil {
 			lastErr = err
 			if !spend(&usedOther, c.retriesOther) {
@@ -342,6 +357,13 @@ retry:
 		return nil, retries, fmt.Errorf("%w after %d retries: %w", ErrRateLimited, retries, lastErr)
 	}
 	return nil, retries, fmt.Errorf("llm: request failed after %d retries: %w", retries, lastErr)
+}
+
+// attempted reports that one HTTP exchange finished, however it went.
+func (c *Client) attempted() {
+	if c.onAttempt != nil {
+		c.onAttempt()
+	}
 }
 
 // spend consumes one unit of a retry budget, reporting whether there was one

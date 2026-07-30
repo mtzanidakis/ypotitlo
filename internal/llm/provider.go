@@ -63,6 +63,7 @@ type OpenCodeGoConfig struct {
 	Prices       map[string]TokenPrice
 	ExtraHeaders map[string]string
 	BaseURL      string // overridable for tests and for the zen/v1 endpoint
+	OnAttempt    func() // called after every HTTP exchange; see Config.OnAttempt
 }
 
 // NewOpenCodeGo builds the OpenCode Zen provider (OpenAI-compatible; no
@@ -81,7 +82,7 @@ func NewOpenCodeGo(cfg OpenCodeGoConfig) *Client {
 	return NewClient(Config{
 		Name: "opencode-go", BaseURL: base, APIKey: cfg.APIKey, KeySource: cfg.KeySource,
 		ReportsCost: false, TryJSONSchema: false, Prices: prices, ExtraHeaders: cfg.ExtraHeaders,
-		Budget: cfg.Budget, HTTP: cfg.HTTP, Now: cfg.Now, Sleep: cfg.Sleep, Rand: cfg.Rand,
+		Budget: cfg.Budget, HTTP: cfg.HTTP, Now: cfg.Now, Sleep: cfg.Sleep, OnAttempt: cfg.OnAttempt, Rand: cfg.Rand,
 	})
 }
 

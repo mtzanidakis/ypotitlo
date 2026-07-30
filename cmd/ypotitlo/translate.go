@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mtzanidakis/ypotitlo/internal/charset"
@@ -170,6 +169,16 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		return err
 	}
 
+	// The status line is drawn only for an interactive run: a pipe, a log file
+	// or -q gets clean output instead of a stream of carriage returns.
+	ui := newProgressUI(e.Stderr, !f.quiet && !f.dryRun && isTerminal(e.Stderr), e.Now)
+	defer ui.Stop()
+
+	// Warnings go through the UI so they never land on top of the spinner.
+	warn := func(format string, a ...any) {
+		ui.Suspend(func() { warnf(e, format, a...) })
+	}
+
 	opts := translate.Options{
 		Provider:    provider,
 		Model:       cfg.Model,
@@ -178,17 +187,37 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		Concurrency: cfg.Concurrency,
 		Brief:       !f.noBrief,
 		Rand:        rand.New(rand.NewSource(e.Now().UnixNano())),
-		Warn:        func(format string, a ...any) { warnf(e, format, a...) },
+		Warn:        warn,
+		Phase:       ui.Phase,
+		Progress:    ui.Progress,
 	}
 
+	// The overall deadline covers language detection too. It was created after
+	// it before, leaving one provider call bounded only by the HTTP client's own
+	// timeout times its retries — outside -timeout, outside the watchdog and
+	// outside the call fuse.
+	ctx, cancel := context.WithTimeout(ctx, f.timeout)
+	defer cancel()
+
 	// ---- source language --------------------------------------------------
+	ui.Start()
+	ui.Phase("detecting language")
 	source, provenance, err := resolveSource(ctx, e, file.Cues, f, opts)
 	if err != nil {
 		return err
 	}
 	opts.Source = source
-	if !source.Zero() && (f.verbose || provenance != "") {
-		outf(e.Stderr, "source language: %s (%s)\n", source.English, provenance)
+
+	// One line naming both ends of the translation, so a mistaken target is
+	// obvious at a glance rather than only after the file is written. It always
+	// prints: the target is worth confirming even when the source could not be
+	// worked out, and especially when the target came from the config file
+	// rather than the command line.
+	// Skipped for a dry run, whose report already states both ends in its table.
+	if !f.dryRun {
+		ui.Suspend(func() {
+			outf(e.Stderr, "translating %s -> %s\n", describeSource(source, provenance), target.English)
+		})
 	}
 	if !source.Zero() && source.Code == target.Code && !f.force {
 		return usagef("source and target are both %s; pass -f to translate anyway", target.Code)
@@ -199,24 +228,26 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	}
 
 	// ---- translate --------------------------------------------------------
-	ctx, cancel := context.WithTimeout(ctx, f.timeout)
-	defer cancel()
-
-	if !f.quiet && isTerminal(e.Stderr) {
-		opts.Progress = progressPrinter(e)
-	}
-
 	res, err := translate.Run(ctx, file.Cues, opts)
 	if err != nil {
+		// A failed run has usually already spent something. Reporting the error
+		// without the accounting leaves no way to tell a run that failed on its
+		// first call from one that failed after forty.
+		failed := ui.Elapsed()
+		ui.Stop()
+		writeSpend(e, res.Stats, failed, f)
 		return classifyRunError(err, keySource)
 	}
 	file.Cues = res.Cues
+
+	elapsed := ui.Elapsed()
+	ui.Stop()
 
 	if err := writeOutput(e, file, f, outPath); err != nil {
 		return err
 	}
 
-	writeFooter(e, res.Stats, outPath, f)
+	writeFooter(e, res.Stats, outPath, f, elapsed)
 	return nil
 }
 
@@ -273,20 +304,49 @@ func resolveOutputPath(f translateFlags, target lang.Lang) (string, error) {
 // derivation rule can legitimately produce the input's own name -- translating
 // movie.el.srt into Greek is the obvious case -- and -o can be pointed anywhere.
 func guardOutput(f translateFlags, outPath string) error {
-	if outPath == stdinPath || f.in == stdinPath {
+	// Writing to stdout can clobber nothing.
+	if outPath == stdinPath {
 		return nil
 	}
-	same, err := lang.SameFile(f.in, outPath)
-	if err != nil {
-		return err
-	}
-	if same {
-		return usagef("the output path %q is the input file; pass -o to write somewhere else", outPath)
+	// The same-file check needs two real paths. Reading stdin skips only that
+	// check — it must not also disable the clobber check below, which is what an
+	// earlier combined guard did: "-i - -o existing.srt" overwrote silently.
+	if f.in != stdinPath {
+		same, err := lang.SameFile(f.in, outPath)
+		if err != nil {
+			return err
+		}
+		if same {
+			return usagef("the output path %q is the input file; pass -o to write somewhere else", outPath)
+		}
 	}
 	if _, err := os.Stat(outPath); err == nil && !f.force {
 		return usagef("%q already exists; pass -f to overwrite", outPath)
 	}
+	// Finding out the directory is unwritable after the model calls are paid for
+	// is a bad way to learn it.
+	return checkWritable(filepath.Dir(outPath))
+}
+
+// checkWritable confirms a file can be created in dir.
+func checkWritable(dir string) error {
+	probe, err := os.CreateTemp(dir, ".ypotitlo-probe-*")
+	if err != nil {
+		return fmt.Errorf("cannot write to %s: %w", dir, err)
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
 	return nil
+}
+
+// outputMode is the mode for a new output file: the existing file's when
+// replacing one, otherwise 0644 less the process umask.
+func outputMode(outPath string) os.FileMode {
+	if fi, err := os.Stat(outPath); err == nil {
+		return fi.Mode().Perm()
+	}
+	return 0o644 &^ os.FileMode(umask())
 }
 
 func resolveSource(ctx context.Context, e env, cues []srt.Cue, f translateFlags, opts translate.Options) (lang.Lang, string, error) {
@@ -412,11 +472,23 @@ func writeOutput(e env, file *srt.File, f translateFlags, outPath string) error 
 		_ = tmp.Close()
 		return err
 	}
+	// Flush to the device before the rename. Without this the rename can be
+	// committed while the data blocks are not, which on a power loss or a NAS
+	// reconnect replaces a good file with a truncated one — the opposite of what
+	// the atomic write is for. A sync failure is worth reporting but not worth
+	// discarding a finished translation over.
+	if err := tmp.Sync(); err != nil {
+		warnf(e, "could not flush %s to disk: %v", filepath.Base(tmpName), err)
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
+	// Permission bits are cosmetic next to the content. CIFS and NFS mounts
+	// routinely refuse chmod, and the output here is usually on one — losing a
+	// translation that has already been paid for because its mode could not be
+	// adjusted is the wrong trade.
+	if err := os.Chmod(tmpName, outputMode(outPath)); err != nil {
+		warnf(e, "could not set permissions on the output: %v", err)
 	}
 	return os.Rename(tmpName, outPath)
 }
@@ -443,7 +515,7 @@ func reportDryRun(e env, file *srt.File, f translateFlags, cfg config.Config, so
 	return nil
 }
 
-func writeFooter(e env, s translate.Stats, outPath string, f translateFlags) {
+func writeFooter(e env, s translate.Stats, outPath string, f translateFlags, elapsed time.Duration) {
 	if f.quiet {
 		return
 	}
@@ -451,7 +523,7 @@ func writeFooter(e env, s translate.Stats, outPath string, f translateFlags) {
 	if s.UnknownCost > 0 {
 		cost = fmt.Sprintf("%s + %d calls of unknown cost", cost, s.UnknownCost)
 	}
-	outf(e.Stderr, "wrote %s\n", displayPath(outPath))
+	outf(e.Stderr, "wrote %s in %s\n", displayPath(outPath), clock(elapsed))
 	outf(e.Stderr, "%d calls · %d in / %d out tokens · %s · %d retries · %d cues untranslated\n",
 		s.Calls, s.PromptTokens, s.CompletionTokens, cost, s.Retries, s.Untranslated)
 	if s.Untranslated > 0 {
@@ -459,28 +531,20 @@ func writeFooter(e env, s translate.Stats, outPath string, f translateFlags) {
 	}
 }
 
-// progressPrinter rate-limits to roughly one line a second so a long run looks
-// alive without flooding a terminal.
-func progressPrinter(e env) func(done, total int) {
-	var mu sync.Mutex
-	last := time.Time{}
-	return func(done, total int) {
-		mu.Lock()
-		defer mu.Unlock()
-		now := e.Now()
-		if done < total && now.Sub(last) < time.Second {
-			return
-		}
-		last = now
-		outf(e.Stderr, "\rtranslating %d/%d cues", done, total)
-		if done >= total {
-			outf(e.Stderr, "\n")
-		}
-	}
-}
-
 func warnf(e env, format string, a ...any) {
 	outf(e.Stderr, "warning: "+format+"\n", a...)
+}
+
+// describeSource renders the source language with where it came from, or says
+// plainly that it is unknown — which is a supported case, not a failure.
+func describeSource(source lang.Lang, provenance string) string {
+	if source.Zero() {
+		return "an undetermined language"
+	}
+	if provenance == "" {
+		return source.English
+	}
+	return fmt.Sprintf("%s (%s)", source.English, provenance)
 }
 
 func displayPath(p string) string {
@@ -554,4 +618,18 @@ func translateUsage(w io.Writer) {
 			"ypotitlo translate -i movie.srt -il en -ol el -o out.srt",
 			"ypotitlo translate -i movie.en.srt -ol el -n",
 		})
+}
+
+// writeSpend reports what a run cost when it did not produce a file. Nothing is
+// written in that case, so the accounting is the only evidence of the attempt.
+func writeSpend(e env, s translate.Stats, elapsed time.Duration, f translateFlags) {
+	if f.quiet || s.Calls == 0 {
+		return
+	}
+	cost := fmt.Sprintf("~$%.4f", s.CostUSD)
+	if s.UnknownCost > 0 {
+		cost = fmt.Sprintf("%s + %d calls of unknown cost", cost, s.UnknownCost)
+	}
+	outf(e.Stderr, "spent %d calls · %d in / %d out tokens · %s · in %s\n",
+		s.Calls, s.PromptTokens, s.CompletionTokens, cost, clock(elapsed))
 }

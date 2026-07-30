@@ -383,3 +383,61 @@ func TestUpgradeHelp(t *testing.T) {
 		}
 	}
 }
+
+// Reading stdin skips the same-file check, but must not disable the clobber
+// check. An earlier combined guard returned early for either sentinel, so
+// "-i - -o existing.srt" overwrote silently.
+func TestStdinInputStillRefusesToClobber(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "existing.srt")
+	if err := os.WriteFile(out, []byte("PRECIOUS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := guardOutput(translateFlags{in: stdinPath, out: out}, out)
+	if err == nil {
+		t.Fatal("guardOutput allowed an existing file to be overwritten from stdin")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error = %q, want it to mention the existing file", err)
+	}
+
+	// -f still permits it.
+	if err := guardOutput(translateFlags{in: stdinPath, out: out, force: true}, out); err != nil {
+		t.Errorf("-f should permit the overwrite: %v", err)
+	}
+}
+
+// Writing to stdout can clobber nothing and must not be blocked.
+func TestStdoutOutputIsNeverGuarded(t *testing.T) {
+	t.Parallel()
+
+	if err := guardOutput(translateFlags{in: stdinPath, out: stdinPath}, stdinPath); err != nil {
+		t.Errorf("writing to stdout was refused: %v", err)
+	}
+}
+
+// An unwritable output directory has to be found before the model calls are
+// paid for, not after.
+func TestUnwritableOutputDirIsCaughtEarly(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	in := filepath.Join(t.TempDir(), "movie.en.srt")
+	if err := os.WriteFile(in, []byte("1\n00:00:01,000 --> 00:00:02,000\nHi.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := guardOutput(translateFlags{in: in}, filepath.Join(dir, "movie.el.srt"))
+	if err == nil {
+		t.Skip("running as a user who can write to a 0500 directory")
+	}
+	if !strings.Contains(err.Error(), "cannot write") {
+		t.Errorf("error = %q, want it to say the directory is unwritable", err)
+	}
+}

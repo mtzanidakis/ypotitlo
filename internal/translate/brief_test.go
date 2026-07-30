@@ -3,11 +3,13 @@ package translate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/mtzanidakis/ypotitlo/internal/lang"
 	"github.com/mtzanidakis/ypotitlo/internal/llm"
+	"github.com/mtzanidakis/ypotitlo/internal/srt"
 )
 
 const briefJSON = `{
@@ -279,5 +281,62 @@ func TestTargetAddendumFallsBackToTheBaseLanguage(t *testing.T) {
 	}
 	if got := targetAddendum(lang.Lang{Code: "xx-YY"}); got != "" {
 		t.Errorf("unknown regional target got %q", got)
+	}
+}
+
+// TestBriefSourceSamplesAcrossTheWholeFile pins the difference between sampling
+// and truncating. A prefix reads only the opening, which is where the cast is
+// least established: a character introduced late would be absent from the brief,
+// and every batch covering them translated without their name or register.
+func TestBriefSourceSamplesAcrossTheWholeFile(t *testing.T) {
+	t.Parallel()
+
+	// Enough cues to blow the budget several times over.
+	line := strings.Repeat("x", 200)
+	cues := make([]srt.Cue, 400)
+	for i := range cues {
+		cues[i] = cue(fmt.Sprint(i+1), 0, 1000, fmt.Sprintf("%04d %s", i, line))
+	}
+
+	got, sampled := briefSource(cues)
+	if !sampled {
+		t.Fatal("a file well over budget should report being sampled")
+	}
+	if len(got) > briefCharBudget {
+		t.Errorf("sample is %d chars, over the %d budget", len(got), briefCharBudget)
+	}
+
+	// The sample must reach the end of the file, not stop early.
+	first := strings.SplitN(got, "\n", 2)[0]
+	if !strings.HasPrefix(first, "0000") {
+		t.Errorf("sample does not start at the beginning: %q", first[:min(12, len(first))])
+	}
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	last := lines[len(lines)-1]
+	var idx int
+	if _, err := fmt.Sscanf(last, "%04d", &idx); err != nil {
+		t.Fatalf("unexpected last line %q", last[:min(12, len(last))])
+	}
+	if idx < len(cues)*3/4 {
+		t.Errorf("sample stops at cue %d of %d; it must span the file", idx, len(cues))
+	}
+}
+
+// A file inside the budget is passed through whole and not reported as sampled.
+func TestBriefSourceKeepsASmallFileWhole(t *testing.T) {
+	t.Parallel()
+
+	cues := []srt.Cue{
+		cue("1", 0, 1000, "First line."),
+		cue("2", 1000, 2000, "Second line."),
+	}
+	got, sampled := briefSource(cues)
+	if sampled {
+		t.Error("a short file must not be reported as sampled")
+	}
+	for _, want := range []string{"First line.", "Second line."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output %q missing %q", got, want)
+		}
 	}
 }

@@ -48,6 +48,18 @@ const (
 	// watchdogPoll is how often the stall watchdog looks at the clock.
 	watchdogPoll = 2 * time.Second
 
+	// briefTimeout bounds pass 0, generously, and stays under
+	// defaultStallTimeout so a slow brief is abandoned on its own terms rather
+	// than starving the translation of its stall budget.
+	//
+	// Measured on a 734-cue episode against deepseek-v4-flash: the brief takes
+	// about 65 seconds and spends 10k completion tokens, nine tenths of them
+	// thinking. An earlier 90-second limit therefore fitted the happy path and
+	// nothing else — CompleteJSON makes a second call when the JSON needs
+	// repairing, which alone doubles it, and the client may retry a 5xx on top.
+	// The room here is for the whole sequence, not one call.
+	briefTimeout = 4 * time.Minute
+
 	// defaultStallTimeout is how long a run may go without a single batch
 	// completing. Comfortably above the slowest observed batch on a reasoning
 	// model, and far below the time a hung connection would otherwise burn.
@@ -124,9 +136,14 @@ type Options struct {
 	// a couple of splits.
 	MaxCalls int
 
-	// StallTimeout aborts the run when no batch has completed within it.
+	// StallTimeout aborts the run when nothing has advanced within it.
 	// 0 means defaultStallTimeout.
 	StallTimeout time.Duration
+
+	// BriefTimeout bounds pass 0. 0 means briefTimeout. It is separate from
+	// StallTimeout because the brief is optional: exceeding this is a warning
+	// and the translation carries on, whereas exceeding StallTimeout is fatal.
+	BriefTimeout time.Duration
 
 	// Now is the clock the stall watchdog reads, injected for tests.
 	Now func() time.Time
@@ -152,6 +169,11 @@ type Options struct {
 	// Progress is called as batches complete, with the number of cues finished
 	// and the total. Serialised like Warn.
 	Progress func(done, total int)
+
+	// Phase is called when the run moves to a new stage ("brief",
+	// "translating"), so a caller drawing a status line can say what is
+	// happening rather than leaving minutes of silence. Serialised like Warn.
+	Phase func(name string)
 }
 
 // Stats is the accounting for one run.
@@ -219,16 +241,38 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 	stop := r.watchdog(ctx)
 	defer stop()
 
-	brief := r.makeBrief(ctx, cues)
+	// Pass 0 runs under its own, much shorter deadline. It is optional by
+	// design — every failure path warns and carries on without it — so it must
+	// not be able to consume the whole run. Before this, a brief that hung ate
+	// the entire stall budget and the watchdog failed the run, which is the
+	// opposite of "continuing without it": an otherwise healthy translation died
+	// in a phase it did not need.
+	r.phase("brief")
+	briefCtx, cancelBrief := context.WithTimeout(ctx, r.briefDeadline())
+	brief := r.makeBrief(briefCtx, cues)
+	cancelBrief()
+
+	// Pass 0 finishing is progress, even when it failed: the call came back.
+	// Its failure is also not evidence about the provider — the brief is bounded
+	// by its own deadline, so a timeout there says nothing about the translation
+	// that follows. Leaving it in the counter started the run one failure closer
+	// to tripping the breaker.
+	r.markProgress()
+	r.resetFailures()
+
+	// Only a cancellation of the *parent* is fatal here — the watchdog tripping,
+	// or the user interrupting. The brief's own deadline is not.
 	if err := r.aborted(); err != nil {
 		return Result{Stats: r.snapshot(), Warnings: r.warningList()}, err
 	}
-	// Pass 0 finishing is progress, even when it failed: the call came back.
-	r.markProgress()
+	if err := ctx.Err(); err != nil {
+		return Result{Stats: r.snapshot(), Warnings: r.warningList()}, err
+	}
 	r.sys = systemPrompt(o.Source, o.Target, brief)
 
 	ranges := planBatches(cues, r.o.BatchSize)
 	r.stats.Batches = len(ranges)
+	r.phase("translating")
 
 	if err := r.work(ctx, cues, ranges); err != nil {
 		return Result{Stats: r.snapshot(), Warnings: r.warningList(), Brief: brief}, err
@@ -285,6 +329,10 @@ type runner struct {
 	// lastProgress is when the run last advanced; see watchdog.
 	lastProgress time.Time
 
+	// cbMu serialises the caller's callbacks without holding mu; see the comment
+	// above phase.
+	cbMu sync.Mutex
+
 	// abort state, shared by the watchdog and the workers so that whichever
 	// notices trouble first stops the whole run.
 	cancel    context.CancelFunc
@@ -302,6 +350,13 @@ func (r *runner) abort(err error) {
 			r.cancel()
 		}
 	})
+}
+
+// resetFailures clears the circuit breaker's counter.
+func (r *runner) resetFailures() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.consecutiveFailures = 0
 }
 
 func (r *runner) aborted() error {
@@ -345,13 +400,34 @@ func (r *runner) budget(n int) {
 	r.maxCalls = 3*batches + 10
 }
 
+// phase reports a stage change to the caller, if it asked for them.
+// The callbacks below are serialised on their own mutex rather than on r.mu.
+//
+// Holding the run's central lock across a caller's callback means terminal I/O
+// runs under it, and a blocked write to stderr — a stopped pager, flow control —
+// would then freeze every worker *and* idleFor, so the stall watchdog could not
+// fire. That is precisely the class of undetectable hang the watchdog exists to
+// catch, so it must not be reachable through the reporting path.
+func (r *runner) phase(name string) {
+	if r.o.Phase == nil {
+		return
+	}
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.o.Phase(name)
+}
+
 func (r *runner) warn(format string, a ...any) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.warnings = append(r.warnings, fmt.Sprintf(format, a...))
-	if r.o.Warn != nil {
-		r.o.Warn(format, a...)
+	r.mu.Unlock()
+
+	if r.o.Warn == nil {
+		return
 	}
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.o.Warn(format, a...)
 }
 
 // reserve claims one call against the fuse.
@@ -400,11 +476,16 @@ func (r *runner) warningList() []string {
 
 func (r *runner) progress(n int) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.done += n
-	if r.o.Progress != nil {
-		r.o.Progress(r.done, r.total)
+	done, total := r.done, r.total
+	r.mu.Unlock()
+
+	if r.o.Progress == nil {
+		return
 	}
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.o.Progress(done, total)
 }
 
 // call performs one provider call under the fuse.
@@ -414,6 +495,16 @@ func (r *runner) call(ctx context.Context, req llm.Request) (llm.Response, error
 	}
 	resp, err := r.o.Provider.Complete(ctx, req)
 	r.record(resp)
+
+	// A call that came back at all is proof the provider is answering, which is
+	// the only thing the watchdog exists to detect. Resetting on batch
+	// completion instead was too coarse: one batch is up to four sequential
+	// calls, and one call is up to six HTTP attempts with backoff — a provider
+	// answering 429 with Retry-After: 60 five times spends five minutes inside a
+	// single call that ultimately succeeds, and the watchdog would kill the run
+	// and blame a silent connection.
+	r.markProgress()
+
 	if err := r.trip(err); err != nil {
 		return resp, err
 	}
@@ -436,14 +527,19 @@ func (r *runner) trip(err error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if err == nil || errors.Is(err, llm.ErrTruncated) {
+	if err == nil || errors.Is(err, llm.ErrTruncated) || errors.Is(err, llm.ErrRateLimited) {
 		r.consecutiveFailures = 0
 		return nil
 	}
 
 	r.consecutiveFailures++
 	r.lastFailure = err
-	if r.consecutiveFailures < maxConsecutiveFailures {
+
+	// The counter is shared by every worker, so the threshold has to scale with
+	// them: four workers meeting one bad minute each produce four failures with
+	// no success in between, which says nothing about the provider being dead.
+	limit := maxConsecutiveFailures * max(1, r.o.Concurrency)
+	if r.consecutiveFailures < limit {
 		return nil
 	}
 	return fmt.Errorf("%w after %d consecutive failures: %w",
@@ -470,10 +566,7 @@ func (g guarded) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 // there. Any completed batch resets the clock, so a slow model is not mistaken
 // for a stuck one.
 func (r *runner) watchdog(ctx context.Context) (stop func()) {
-	limit := r.o.StallTimeout
-	if limit <= 0 {
-		limit = defaultStallTimeout
-	}
+	limit := r.effectiveStallTimeout()
 
 	// The poll interval is short and independent of the limit. Waking a few
 	// times a minute costs nothing, and tying it to the limit would make the
@@ -502,7 +595,31 @@ func (r *runner) watchdog(ctx context.Context) (stop func()) {
 	return func() { close(done) }
 }
 
-// idleFor is how long it has been since a batch last completed.
+// briefDeadline is how long pass 0 may take.
+func (r *runner) briefDeadline() time.Duration {
+	if r.o.BriefTimeout > 0 {
+		return r.o.BriefTimeout
+	}
+	return briefTimeout
+}
+
+// effectiveStallTimeout is the stall budget actually applied.
+//
+// StallTimeout is exported and unclamped, and a value at or below briefTimeout
+// would turn a brief that is merely slow into a failed run — the exact
+// regression the brief's own deadline was added to remove.
+func (r *runner) effectiveStallTimeout() time.Duration {
+	limit := r.o.StallTimeout
+	if limit <= 0 {
+		limit = defaultStallTimeout
+	}
+	if brief := r.briefDeadline(); limit <= brief {
+		limit = brief + defaultStallTimeout/2
+	}
+	return limit
+}
+
+// idleFor is how long it has been since the run last advanced.
 func (r *runner) idleFor() time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -629,7 +746,7 @@ func (r *runner) runBatch(ctx context.Context, cues []srt.Cue, br batchRange, id
 		before: contextText(cues, max(0, br.start-contextCues), br.start),
 		after:  contextText(cues, br.end, min(len(cues), br.end+contextCues)),
 	}
-	return r.translateGroup(ctx, job, prep, 0)
+	return r.translateGroup(ctx, job, prep, 0, 1)
 }
 
 // batchJob is the read-only context around a group of cues.
@@ -667,11 +784,11 @@ func contextText(cues []srt.Cue, from, to int) []string {
 //	                   translated a second time.
 //	refusal            one retry for the refused cues only, saying what the
 //	                   material is. Then keep the original and warn.
-func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepared, depth int) error {
+func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepared, depth, scale int) error {
 	got := make(map[int]entry, len(prep))
 	skipped := 0
 
-	resp, err := r.call(ctx, r.request(job, prep, prep, "", false, 1))
+	resp, err := r.call(ctx, r.request(job, prep, prep, "", false, scale))
 
 	// A cut-off reply gets a higher ceiling before it gets a smaller batch.
 	//
@@ -691,7 +808,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 	case isFatal(err):
 		return err
 	case truncated(resp, err):
-		return r.splitGroup(ctx, job, prep, depth, "the reply hit the output-token limit even at a raised ceiling")
+		return r.splitGroup(ctx, job, prep, depth, truncationScale, "the reply hit the output-token limit even at a raised ceiling")
 	case err != nil:
 		r.warn("batch %d: call failed: %v", job.id, err)
 	default:
@@ -720,7 +837,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		case isFatal(err2):
 			return err2
 		case truncated(resp2, err2):
-			return r.splitGroup(ctx, job, prep, depth, "the retry hit the output-token limit")
+			return r.splitGroup(ctx, job, prep, depth, truncationScale, "the retry hit the output-token limit")
 		case err2 != nil:
 			r.warn("batch %d: retry failed: %v", job.id, err2)
 		default:
@@ -736,7 +853,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		r.bump(func(s *Stats) { s.Retries++ })
 
 		note := fmt.Sprintf("Your previous reply omitted %d of the cues. Return ONLY the cue ids listed below, one JSON object per line.", len(missing))
-		resp3, err3 := r.call(ctx, r.request(job, prep, missing, note, true, 1))
+		resp3, err3 := r.call(ctx, r.request(job, prep, missing, note, true, scale))
 		switch {
 		case isFatal(err3):
 			return err3
@@ -753,7 +870,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		r.bump(func(s *Stats) { s.Refusals += len(refused); s.Retries++ })
 		r.warn("batch %d: %d cue(s) refused; retrying them once", job.id, len(refused))
 
-		resp4, err4 := r.call(ctx, r.request(job, prep, refused, refusalNudge, true, 1))
+		resp4, err4 := r.call(ctx, r.request(job, prep, refused, refusalNudge, true, scale))
 		switch {
 		case isFatal(err4):
 			return err4
@@ -771,7 +888,13 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 }
 
 // splitGroup halves a group after a truncated reply.
-func (r *runner) splitGroup(ctx context.Context, job batchJob, prep []*prepared, depth int, why string) error {
+//
+// scale is inherited by both halves. Without it each half started again at the
+// base ceiling — half the content, but also half the ceiling that had just
+// proven insufficient — and since the shortfall is per-call reasoning overhead
+// rather than content, every one of the six resulting calls was certain to
+// truncate too.
+func (r *runner) splitGroup(ctx context.Context, job batchJob, prep []*prepared, depth, scale int, why string) error {
 	if depth >= maxSplitDepth || len(prep) < 2 {
 		r.warn("batch %d: %s and the batch cannot be split further; %d cue(s) left untranslated",
 			job.id, why, len(prep))
@@ -789,10 +912,10 @@ func (r *runner) splitGroup(ctx context.Context, job batchJob, prep []*prepared,
 	leftJob := batchJob{id: job.id, before: job.before, after: headText(right, contextCues)}
 	rightJob := batchJob{id: job.id, before: tailText(left, contextCues), after: job.after}
 
-	if err := r.translateGroup(ctx, leftJob, left, depth+1); err != nil {
+	if err := r.translateGroup(ctx, leftJob, left, depth+1, scale); err != nil {
 		return err
 	}
-	return r.translateGroup(ctx, rightJob, right, depth+1)
+	return r.translateGroup(ctx, rightJob, right, depth+1, scale)
 }
 
 // apply validates every reply entry and writes the cues that survived.

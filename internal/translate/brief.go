@@ -40,7 +40,19 @@ const minBriefCues = 12
 // briefCharBudget caps how much source text is sent. It is generous enough for
 // a three-hour film and small enough that a pathological input cannot turn pass
 // 0 into the most expensive call of the run.
-const briefCharBudget = 120_000
+// briefCharBudget bounds the dialogue sent to pass 0.
+//
+// It is far smaller than a film's script on purpose, and the reason is
+// measurable: pass 0's cost is dominated by reasoning over the dialogue, not by
+// the shape of the reply. On a 734-cue episode against deepseek-v4-flash,
+// trimming the requested fields cut the generated content by two thirds but the
+// reasoning by only a sixth — 14.3k tokens of it remained, on 7.8k tokens of
+// input. The input is the lever.
+//
+// The brief needs enough dialogue to place the cast, the register between them
+// and the recurring terms. It does not need every line, and beyond a point more
+// text buys nothing but latency on the one call that gates the whole run.
+const briefCharBudget = 16_000
 
 // Brief is the pass-0 analysis of the whole file.
 type Brief struct {
@@ -56,7 +68,6 @@ type BriefCharacter struct {
 	Name     string `json:"name"`
 	Rendered string `json:"rendered"`
 	Gender   string `json:"gender"`
-	Note     string `json:"note"`
 }
 
 // BriefRegister is the second-person form one character uses towards another.
@@ -71,7 +82,6 @@ type BriefRegister struct {
 type BriefTerm struct {
 	Term     string `json:"term"`
 	Rendered string `json:"rendered"`
-	Note     string `json:"note"`
 }
 
 // empty reports whether the brief carries nothing worth injecting.
@@ -100,9 +110,6 @@ func (b *Brief) prompt() string {
 			if c.Gender != "" {
 				fmt.Fprintf(&sb, " (%s)", c.Gender)
 			}
-			if c.Note != "" {
-				fmt.Fprintf(&sb, " — %s", c.Note)
-			}
 		}
 	}
 	if len(b.Register) > 0 {
@@ -118,9 +125,6 @@ func (b *Brief) prompt() string {
 		sb.WriteString("\nGlossary (fixed renderings):")
 		for _, g := range b.Glossary {
 			fmt.Fprintf(&sb, "\n  %s → %s", g.Term, orDash(g.Rendered))
-			if g.Note != "" {
-				fmt.Fprintf(&sb, " — %s", g.Note)
-			}
 		}
 	}
 	return sb.String()
@@ -135,6 +139,14 @@ func orDash(s string) string {
 
 // briefSchema is embedded in the prompt by the llm client (OpenCode Zen rejects
 // response_format: json_schema outright, so the schema goes in as text).
+//
+// Every field here is paid for twice over. Embedding the schema instructs the
+// model to "include every property", so an optional-looking field is generated
+// for every array element, and each one is reasoned about first. Measured on a
+// 734-cue episode against deepseek-v4-flash: adding the schema message took one
+// call from 65s and 9.2k reasoning tokens to 134s and 17.2k. Free-text "note"
+// fields on characters and glossary terms were the bulk of that and bought
+// nothing the translator needed, so they are gone. Keep this shape lean.
 var briefSchema = &llm.JSONSchema{
 	Name: "subtitle_brief",
 	Schema: map[string]any{
@@ -148,7 +160,6 @@ var briefSchema = &llm.JSONSchema{
 						"name":     map[string]any{"type": "string"},
 						"rendered": map[string]any{"type": "string"},
 						"gender":   map[string]any{"type": "string"},
-						"note":     map[string]any{"type": "string"},
 					},
 				},
 			},
@@ -171,7 +182,6 @@ var briefSchema = &llm.JSONSchema{
 					"properties": map[string]any{
 						"term":     map[string]any{"type": "string"},
 						"rendered": map[string]any{"type": "string"},
-						"note":     map[string]any{"type": "string"},
 					},
 				},
 			},
@@ -189,12 +199,12 @@ func (r *runner) makeBrief(ctx context.Context, cues []srt.Cue) *Brief {
 		return nil
 	}
 
-	body, truncated := briefSource(cues)
+	body, sampled := briefSource(cues)
 	if strings.TrimSpace(body) == "" {
 		return nil
 	}
-	if truncated {
-		r.warn("brief: source truncated to %d characters", briefCharBudget)
+	if sampled {
+		r.warn("brief: dialogue sampled down to %d characters", briefCharBudget)
 	}
 
 	target := r.o.Target.English
@@ -206,13 +216,13 @@ func (r *runner) makeBrief(ctx context.Context, cues []srt.Cue) *Brief {
 	user := fmt.Sprintf(`Below is the complete dialogue of one film, one cue per line.
 
 Analyse it and return JSON describing how it must be translated from %s into %s:
-- characters: every named or clearly identifiable speaker, with "rendered" set to the exact spelling of the name in %s and "gender" one of male, female, unknown.
-- register: for each pair of characters who address each other, the second-person form to use in %s (for Greek: "εσύ" or "εσείς"), with a one-clause reason. Include a pair only when the dialogue actually shows them speaking to each other.
-- glossary: recurring terms, jargon, nicknames, institutions and catchphrases, each with the single rendering to use everywhere.
+- characters: the named speakers who actually matter, at most 12, with "rendered" set to the exact spelling of the name in %s and "gender" one of male, female, unknown.
+- register: at most 8 pairs of characters who address each other, the second-person form to use in %s (for Greek: "εσύ" or "εσείς"), and a reason of at most eight words. Include a pair only when the dialogue actually shows them speaking to each other.
+- glossary: at most 12 recurring terms, jargon, nicknames, institutions or catchphrases, each with the single rendering to use everywhere.
 - tone: one sentence on the register and style of the film as a whole.
 - setting: one sentence on period, place and milieu.
 
-Be concrete and be brief. This is read by a translator, not an audience.
+Be terse. Every field is a lookup for a translator mid-sentence, not prose for an audience. Do not explain your reasoning.
 
 DIALOGUE:
 %s`, src, target, target, target, body)
@@ -247,18 +257,37 @@ DIALOGUE:
 }
 
 // briefSource renders the dialogue for pass 0, one cue per line.
-func briefSource(cues []srt.Cue) (text string, truncated bool) {
-	var sb strings.Builder
+func briefSource(cues []srt.Cue) (text string, sampled bool) {
+	lines := make([]string, 0, len(cues))
+	total := 0
 	for _, c := range cues {
 		line := strings.TrimSpace(strings.Join(c.Lines, " "))
 		if line == "" {
 			continue
 		}
-		if sb.Len()+len(line)+1 > briefCharBudget {
-			return sb.String(), true
+		lines = append(lines, line)
+		total += len(line) + 1
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
+	if total <= briefCharBudget {
+		return strings.Join(lines, "\n") + "\n", false
+	}
+
+	// Over budget: take an even spread rather than a prefix. Truncating the head
+	// reads only the opening of the film, which is exactly where the cast is
+	// least established — a character introduced in the second half would be
+	// missing from the brief, and every batch covering them would then be
+	// translated without their name or their register.
+	stride := (total + briefCharBudget - 1) / briefCharBudget
+	var sb strings.Builder
+	for i := 0; i < len(lines); i += stride {
+		if sb.Len()+len(lines[i])+1 > briefCharBudget {
+			break
 		}
-		sb.WriteString(line)
+		sb.WriteString(lines[i])
 		sb.WriteByte('\n')
 	}
-	return sb.String(), false
+	return sb.String(), true
 }

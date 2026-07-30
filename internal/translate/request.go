@@ -83,69 +83,34 @@ func idList(prep []*prepared) string {
 	return strings.Join(ids, ", ")
 }
 
-// maxTokensFor sizes the output ceiling for one call.
+// maxTokensFor is the output ceiling for one call: a flat value, escalated once
+// when a reply comes back cut off.
 //
-// The obvious design — size the reply from the source text, since a translation
-// runs about as long as its original — wedges the run, and the reason is worth
-// recording because nothing in the API documentation hints at it.
+// It used to be derived from the source text, on the theory that a translation
+// runs about as long as its original. That was wrong three times over, and the
+// arithmetic was in the end dead code — the floor always won. The number is not
+// about the text at all: a reasoning model bills its thinking as completion
+// tokens and spends it before emitting anything, and that budget tracks the
+// difficulty of the task rather than its length. Measured against
+// deepseek-v4-flash on a 734-cue episode, a ceiling of roughly 17k truncated
+// nearly every 20-cue batch, so every batch cost two calls.
 //
-// On a reasoning model the thinking is billed as completion tokens and spent
-// out of max_tokens *before* the first character of the answer appears.
-// Measured against deepseek-v4-pro: two short sentences cost 12 content tokens
-// and 199 reasoning tokens, and "hi" with a ceiling of 50 came back as
-// finish_reason=length with an entirely empty message. On a real 20-cue batch
-// the thinking runs to roughly ten thousand tokens. That budget is not
-// published, varies per model, tracks the difficulty of the task rather than
-// its length, and is not reliably reduced by reasoning_effort.
-//
-// Two consequences follow, and both were learned the expensive way:
-//
-// A ceiling derived from the source text is far too small, so every batch
-// truncates. Halving the batch does not help, because the overhead is per call
-// rather than per cue — a real run went 20 -> 10 -> 5 cues, truncated at every
-// size, and burned the call fuse without producing a file.
-//
-// Omitting max_tokens entirely is the opposite mistake. It removes the
-// truncation but lets a verbose reasoner spend without limit; one feature film
-// then costs more than a dollar in thinking alone.
-//
-// So: a floor generous enough to think in, a cap to bound a runaway, and the
-// source-derived term kept only to let genuinely long batches ask for more.
-// Cost control proper belongs to the budget guard and the call fuse.
-//
-// scale raises the ceiling for a retry after a truncated reply.
-func maxTokensFor(prep []*prepared, scale int) int {
-	if scale < 1 {
-		scale = 1
+// Sizing it generously costs nothing that matters: unused headroom is not
+// billed, only tokens actually produced are, and the real spending limits are
+// the budget guard and the call fuse. A ceiling that is too small, by contrast,
+// costs a doubled call count and then a split cascade.
+func maxTokensFor(_ []*prepared, scale int) int {
+	if scale > 1 {
+		return escalatedBatchTokens
 	}
-	chars := 0
-	for _, p := range prep {
-		for _, s := range p.src {
-			chars += len([]rune(s))
-		}
-	}
-	n := (int(float64(chars)/2.5*3) + 512 + reasoningHeadroom) * scale
-	if n < minBatchTokens {
-		n = minBatchTokens
-	}
-	if n > maxBatchTokens {
-		n = maxBatchTokens
-	}
-	return n
+	return batchTokens
 }
 
 const (
-	// reasoningHeadroom covers the thinking a reasoning model bills against
-	// max_tokens before it answers. Measured at roughly ten thousand tokens for
-	// a 20-cue batch on deepseek-v4-pro; sized above that because a ceiling
-	// that is too high costs nothing unless the model actually uses it, while
-	// one that is too low costs the whole batch. See maxTokensFor.
-	reasoningHeadroom = 16384
+	// batchTokens is what an ordinary call asks for.
+	batchTokens = 65536
 
-	// minBatchTokens is the floor. Even a single-cue batch needs room to think,
-	// and it is thinking rather than output that dominates.
-	minBatchTokens = 16384
-
-	// maxBatchTokens bounds a runaway reasoner.
-	maxBatchTokens = 65536
+	// escalatedBatchTokens is the retry after a truncated reply. It is what
+	// rescued those truncated batches in practice.
+	escalatedBatchTokens = 131072
 )

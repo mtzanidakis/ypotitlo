@@ -764,59 +764,35 @@ func TestRequestSampling(t *testing.T) {
 	if req.ReasoningEffort != reasoningEffort {
 		t.Errorf("reasoning effort = %q, want %q", req.ReasoningEffort, reasoningEffort)
 	}
-	if req.MaxTokens < minBatchTokens || req.MaxTokens > maxBatchTokens {
-		t.Errorf("max tokens = %d, outside [%d,%d]", req.MaxTokens, minBatchTokens, maxBatchTokens)
+	if req.MaxTokens != batchTokens {
+		t.Errorf("max tokens = %d, want %d", req.MaxTokens, batchTokens)
 	}
 	if req.Stage != "batch" || req.Model != "test-model" {
 		t.Errorf("stage/model = %q/%q", req.Stage, req.Model)
 	}
 }
 
-// TestCeilingLeavesRoomToThink pins the constant that wedged a real run.
-//
-// A reasoning model bills its thinking against max_tokens and spends it before
-// emitting anything: measured against deepseek-v4-pro, "hi" with a ceiling of
-// 50 returned finish_reason=length and an empty message, and a 20-cue batch
-// spends on the order of ten thousand tokens thinking. Because that cost is per
-// call rather than per cue, a ceiling sized from the source text truncates
-// every batch however small, and halving does not rescue it.
-func TestCeilingLeavesRoomToThink(t *testing.T) {
+// The ceiling is flat and escalates exactly once. An earlier version derived it
+// from the source text; the floor always won, so that arithmetic was dead and the
+// test guarding it was vacuous — it asserted only that a value did not shrink,
+// while both sides were the same constant.
+func TestCeilingIsFlatAndEscalatesOnce(t *testing.T) {
 	t.Parallel()
 
-	// Even a one-cue batch, whose content needs almost nothing, must carry
-	// enough room for the thinking that precedes it.
-	tiny := maxTokensFor([]*prepared{{src: []string{"Hi."}}}, 1)
-	if tiny < reasoningHeadroom {
-		t.Errorf("ceiling for a one-cue batch = %d, below the reasoning headroom %d", tiny, reasoningHeadroom)
+	small := []*prepared{{src: []string{"Hi."}}}
+	big := []*prepared{{src: []string{strings.Repeat("a longer line of dialogue ", 500)}}}
+
+	if got := maxTokensFor(small, 1); got != batchTokens {
+		t.Errorf("ordinary ceiling = %d, want %d", got, batchTokens)
 	}
-}
-
-func TestCeilingGrowsWithSourceSizeAndIsCapped(t *testing.T) {
-	t.Parallel()
-
-	small := maxTokensFor([]*prepared{{src: []string{"Hi."}}}, 1)
-	big := maxTokensFor([]*prepared{{src: []string{strings.Repeat("a longer line of dialogue ", 500)}}}, 1)
-	if small > big {
-		t.Errorf("ceiling shrank as the source grew: %d vs %d", small, big)
+	if got := maxTokensFor(big, 1); got != batchTokens {
+		t.Errorf("ceiling varied with source length: %d, want a flat %d", got, batchTokens)
 	}
-	if big > maxBatchTokens {
-		t.Errorf("ceiling = %d, above the cap %d: a runaway reasoner must stay bounded", big, maxBatchTokens)
+	if got := maxTokensFor(small, truncationScale); got != escalatedBatchTokens {
+		t.Errorf("escalated ceiling = %d, want %d", got, escalatedBatchTokens)
 	}
-}
-
-// A retry after a truncation does send one, because the model's own default has
-// just proven insufficient.
-func TestRetryCeilingIsExplicitAndLarge(t *testing.T) {
-	t.Parallel()
-
-	prep := []*prepared{{src: []string{"Some dialogue to translate."}}}
-	raised := maxTokensFor(prep, truncationScale)
-
-	if raised < minBatchTokens {
-		t.Errorf("retry ceiling = %d, below the floor %d", raised, minBatchTokens)
-	}
-	if raised > maxBatchTokens {
-		t.Errorf("retry ceiling = %d, above the cap %d", raised, maxBatchTokens)
+	if escalatedBatchTokens <= batchTokens {
+		t.Error("the escalated ceiling must exceed the ordinary one")
 	}
 }
 
@@ -1129,23 +1105,21 @@ func TestSlowProgressDoesNotTripTheWatchdog(t *testing.T) {
 	assertShape(t, in, res.Cues)
 }
 
-// TestWatchdogCoversTheBriefPhase pins a gap found in a real run: the watchdog
-// was armed inside the batch loop, so a pass-0 call that hung went unwatched.
-// The observed run reported "nothing completed for 11m54s" against a six-minute
-// limit, because the clock had been running through the brief the whole time.
-func TestWatchdogCoversTheBriefPhase(t *testing.T) {
+// A brief that overruns its own deadline must leave a *successful* run behind.
+//
+// This is the contract fix after fix: the brief is optional, so exceeding its
+// deadline warns and the translation carries on. An earlier version aborted the
+// whole run, and the test that was supposed to guard the area asserted the
+// opposite — it set a stall timeout below the brief's deadline, a configuration
+// that cannot occur now that the stall budget is clamped above it.
+func TestASlowBriefStillLetsTheRunFinish(t *testing.T) {
 	t.Parallel()
-
-	var mu sync.Mutex
-	now := time.Unix(0, 0).UTC()
-	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
-	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
 
 	var briefCalls atomic.Int32
 	p := &fakeProvider{fnCtx: func(ctx context.Context, req llm.Request, _ int) (llm.Response, error) {
 		if req.Stage == "brief" {
 			briefCalls.Add(1)
-			<-ctx.Done() // the brief hangs, exactly as observed
+			<-ctx.Done() // hangs until its own deadline expires
 			return llm.Response{}, ctx.Err()
 		}
 		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
@@ -1153,32 +1127,138 @@ func TestWatchdogCoversTheBriefPhase(t *testing.T) {
 
 	var warns []string
 	o := opts(p, &warns)
-	o.Brief = true // the point of the test
-	o.Now = clock
-	o.StallTimeout = time.Minute
+	o.Brief = true
+	o.BriefTimeout = 50 * time.Millisecond
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := Run(context.Background(), makeCues(40), o)
-		done <- err
-	}()
+	in := makeCues(40)
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("a brief that timed out must not fail the run: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+	if briefCalls.Load() == 0 {
+		t.Error("the brief was never attempted; the test proves nothing")
+	}
+	if res.Brief != nil {
+		t.Error("a timed-out brief must not be reported as one")
+	}
+	if !hasWarning(warns, "brief") {
+		t.Errorf("warnings = %q, want one about the brief", warns)
+	}
+	// And the cues must actually be translated, not fall back.
+	if res.Stats.Untranslated != 0 {
+		t.Errorf("untranslated = %d; a missing brief must not cost translations", res.Stats.Untranslated)
+	}
+}
 
-	deadline := time.After(10 * time.Second)
-	for {
-		select {
-		case err := <-done:
-			if !errors.Is(err, ErrStalled) {
-				t.Fatalf("Run error = %v, want ErrStalled", err)
-			}
-			if briefCalls.Load() == 0 {
-				t.Error("the brief was never attempted; the test proves nothing")
-			}
-			return
-		case <-deadline:
-			t.Fatal("a hanging brief was not caught: the watchdog does not cover pass 0")
-		default:
-			advance(30 * time.Second)
-			time.Sleep(2 * time.Millisecond)
+// A batch that takes many sequential calls must not trip the stall watchdog.
+//
+// The clock used to reset only when a whole batch completed, but one batch is up
+// to four calls and one call up to six HTTP attempts with backoff. A provider
+// answering 429 with a long Retry-After five times spends minutes inside a
+// single call that ultimately succeeds — and the run was killed for it, with a
+// message blaming a silent connection.
+func TestSlowCallsWithinOneBatchDoNotTripTheWatchdog(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clockFn := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+
+	p := &fakeProvider{fn: func(req llm.Request, n int) (llm.Response, error) {
+		// Every call takes most of the stall budget, and the batch needs several.
+		mu.Lock()
+		now = now.Add(50 * time.Second)
+		mu.Unlock()
+		if n < 3 {
+			return llm.Response{Content: "unparseable"}, nil
 		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Now = clockFn
+	o.StallTimeout = time.Minute
+	o.Concurrency = 1
+
+	in := makeCues(4)
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("a batch of slow but answered calls must not be killed: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+}
+
+// A rate limit is the provider asking to be asked less often, not an outage, so
+// it must not feed the circuit breaker.
+func TestRateLimitDoesNotTripTheBreaker(t *testing.T) {
+	t.Parallel()
+
+	var n atomic.Int32
+	p := &fakeProvider{fn: func(req llm.Request, _ int) (llm.Response, error) {
+		// Far more consecutive rate limits than the breaker's threshold.
+		if n.Add(1) <= 40 {
+			return llm.Response{}, fmt.Errorf("%w after 5 retries: http 429", llm.ErrRateLimited)
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Concurrency = 1
+
+	in := makeCues(60)
+	_, err := Run(context.Background(), in, o)
+	if errors.Is(err, ErrProviderUnreachable) {
+		t.Error("rate limiting tripped the circuit breaker; it is not an outage")
+	}
+}
+
+// The breaker's counter is shared by every worker, so its threshold has to scale
+// with concurrency: four workers meeting one bad minute each is not an outage.
+func TestBreakerThresholdScalesWithConcurrency(t *testing.T) {
+	t.Parallel()
+
+	var n atomic.Int32
+	p := &fakeProvider{fn: func(req llm.Request, _ int) (llm.Response, error) {
+		// Exactly maxConsecutiveFailures failures, then success — enough to trip
+		// a single shared counter but not a per-worker-scaled one.
+		if n.Add(1) <= maxConsecutiveFailures {
+			return llm.Response{}, fmt.Errorf("transient")
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Concurrency = 4
+
+	in := makeCues(200)
+	if _, err := Run(context.Background(), in, o); errors.Is(err, ErrProviderUnreachable) {
+		t.Errorf("%d failures across %d workers tripped the breaker", maxConsecutiveFailures, o.Concurrency)
+	}
+}
+
+// A stall timeout at or below the brief's own deadline would turn a merely slow
+// brief into a failed run, which is the regression the brief's deadline removed.
+func TestStallTimeoutIsClampedAboveTheBriefDeadline(t *testing.T) {
+	t.Parallel()
+
+	r := newRunner(Options{StallTimeout: time.Second})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.cancel = cancel
+	r.lastProgress = r.clock()
+
+	stop := r.watchdog(ctx)
+	defer stop()
+
+	// The brief's deadline must fit inside the effective stall budget.
+	if got := r.effectiveStallTimeout(); got <= briefTimeout {
+		t.Errorf("effective stall timeout = %v, must exceed briefTimeout %v", got, briefTimeout)
 	}
 }

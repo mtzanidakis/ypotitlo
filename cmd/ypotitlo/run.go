@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 )
 
@@ -51,6 +52,12 @@ func outf(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
 }
 
+// rowf writes one tabwriter row. Same reasoning as outf: a tabwriter over
+// stdout has nowhere useful to report a write failure.
+func rowf(tw *tabwriter.Writer, format string, a ...any) {
+	_, _ = fmt.Fprintf(tw, format, a...)
+}
+
 // usageError marks an error as a misuse of the command line rather than a
 // runtime failure, so run can map it to exitUsage.
 type usageError struct{ err error }
@@ -69,7 +76,11 @@ type command struct {
 
 func commands() map[string]command {
 	return map[string]command{
-		"version": {cmdVersion, "Print the ypotitlo version"},
+		"list-models":  {cmdListModels, "List the models the endpoint offers"},
+		"config-show":  {cmdConfigShow, "Show the effective config and where each value came from"},
+		"config-set":   {cmdConfigSet, "Set a configuration value"},
+		"config-unset": {cmdConfigUnset, "Remove a configuration value"},
+		"version":      {cmdVersion, "Print the ypotitlo version"},
 	}
 }
 

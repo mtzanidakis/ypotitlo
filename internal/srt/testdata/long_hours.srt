@@ -1,0 +1,11 @@
+1
+100:00:00,000 --> 100:00:02,000
+Three digit hours.
+
+2
+25:30:00,500 --> 25:30:03,000
+Past the twenty-four hour mark.
+
+3
+00:90:00,000 --> 00:90:05,000
+Ninety minutes, out of range but kept.

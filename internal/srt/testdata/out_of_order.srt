@@ -1,0 +1,15 @@
+1
+00:00:10,000 --> 00:00:12,000
+The latest cue comes first.
+
+2
+00:00:02,000 --> 00:00:08,000
+An earlier cue, overlapping the next one.
+
+3
+00:00:05,000 --> 00:00:09,000
+Overlaps the cue above.
+
+4
+00:00:09,000 --> 00:00:08,000
+Ends before it starts.

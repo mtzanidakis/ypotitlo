@@ -1,0 +1,6 @@
+00:00:01,000 --> 00:00:02,000
+No index line at all.
+
+00:00:03,000 --> 00:00:04,000
+None here either,
+on two lines.

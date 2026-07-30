@@ -1,0 +1,10 @@
+1
+00:00:01,000 --> 00:00:02,000
+Before the blank line
+
+after the blank line.
+
+
+2
+00:00:03,000 --> 00:00:04,000
+Two blank lines before this cue collapse into one.

@@ -1,0 +1,11 @@
+1
+00:00:01.000 --> 00:00:02.500
+Dot as the millisecond separator.
+
+2
+00:00:03,5 --> 00:00:04,05
+One and two millisecond digits.
+
+3
+00:00:05,12345 --> 00:00:06,999
+More than three millisecond digits.

@@ -1,0 +1,11 @@
+1
+0:01:30 --> 0:01:35
+HH:MM:SS with no milliseconds at all.
+
+2
+00:01:36:500 --> 00:01:38:750
+HH:MM:SS:mmm in the very same file.
+
+3
+02:00 --> 02:05
+MM:SS only.

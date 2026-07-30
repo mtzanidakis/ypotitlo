@@ -103,8 +103,8 @@ func TestETACountsDownBetweenUpdates(t *testing.T) {
 	}
 }
 
-// It never counts below zero, however long a final batch takes.
-func TestETAFloorsAtZero(t *testing.T) {
+// It stops being shown once it runs out, however long a final batch takes.
+func TestETAIsWithdrawnWhenExhausted(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
@@ -124,12 +124,11 @@ func TestETAFloorsAtZero(t *testing.T) {
 	now = now.Add(time.Hour)
 	mu.Unlock()
 
-	got, ok := p.etaFor(t)
-	if !ok {
-		t.Fatal("the ETA disappeared")
-	}
-	if got != 0 {
-		t.Errorf("ETA = %v after overrunning, want 0", got)
+	// An exhausted estimate is withdrawn rather than pinned at zero: it is no
+	// longer an estimate, and "eta 0:00" for minutes on end reads as a broken
+	// display rather than as "no longer known".
+	if _, ok := p.etaFor(t); ok {
+		t.Error("an ETA was still shown after the estimate ran out")
 	}
 }
 

@@ -279,8 +279,13 @@ func (p *progressUI) eta() (time.Duration, bool) {
 		return 0, false
 	}
 	left := p.etaValue - p.now().Sub(p.etaAt)
-	if left < 0 {
-		left = 0
+	// Once the estimate is spent it is simply wrong, and the honest thing is to
+	// stop showing one rather than to park it at zero. A run whose last batches
+	// are slower than the ones before it would otherwise sit on "eta 0:00" for
+	// minutes, which reads as a broken display rather than as "no longer known".
+	// The elapsed time keeps counting, so the run still visibly lives.
+	if left <= 0 {
+		return 0, false
 	}
 	return left, true
 }

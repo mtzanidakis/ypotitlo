@@ -303,3 +303,19 @@ func TestETAThresholdBoundary(t *testing.T) {
 		t.Errorf("no ETA at %d/%d, the %d%% threshold", at, total, etaMinPercent)
 	}
 }
+
+// The denominator shows before the first batch lands, so a short run does not
+// animate a phase with no idea of its size.
+func TestProgressShowsTheTotalBeforeAnyIsDone(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	p := newProgressUI(&buf, true, func() time.Time { return time.Unix(0, 0).UTC() })
+	p.Phase("translating")
+
+	buf.Reset()
+	p.Progress(0, 25)
+	if !strings.Contains(buf.String(), "0/25") {
+		t.Errorf("output = %q, want the total shown straight away", buf.String())
+	}
+}

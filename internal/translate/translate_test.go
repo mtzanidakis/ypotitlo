@@ -600,8 +600,13 @@ func TestRunConcurrencyPreservesOrder(t *testing.T) {
 			t.Fatalf("cue %d out of order: %q, want %q", i, c.Lines[0], want)
 		}
 	}
-	if len(progress) != res.Stats.Batches {
-		t.Errorf("progress called %d times, want %d", len(progress), res.Stats.Batches)
+	// One report per batch, plus the opening zero that announces the total
+	// before anything has finished.
+	if want := res.Stats.Batches + 1; len(progress) != want {
+		t.Errorf("progress called %d times, want %d", len(progress), want)
+	}
+	if first := progress[0]; first[0] != 0 || first[1] != n {
+		t.Errorf("first progress = %v, want [0 %d]", first, n)
 	}
 	if last := progress[len(progress)-1]; last[0] != n || last[1] != n {
 		t.Errorf("final progress = %v, want [%d %d]", last, n, n)

@@ -315,6 +315,11 @@ func (r *runner) translateAll(ctx context.Context, cues []srt.Cue, brief *Brief)
 	r.stats.Batches = len(ranges)
 	r.phase("translating")
 
+	// Report the denominator before any batch has landed. Progress otherwise
+	// arrives only on completion, so a short run — a resume filling in a couple
+	// of dozen cues — could finish without ever showing how many there were.
+	r.progress(0)
+
 	if err := r.work(ctx, cues, ranges); err != nil {
 		// The cues are assembled even here. Whatever finished before the failure
 		// is a complete, valid subtitle file with some cues still in the source

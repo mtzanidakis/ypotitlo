@@ -3,6 +3,7 @@ package translate
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -122,4 +123,29 @@ func looksRefusal(reply string) bool {
 		}
 	}
 	return false
+}
+
+// snippet renders the start of a model reply for a diagnostic message.
+//
+// A warning that a reply could not be parsed says nothing about why. The reply
+// itself usually does — a prose preamble, a refusal the detector missed, a
+// different serialisation — and without it the only way to find out is to
+// reproduce a failure that happens in one batch out of forty.
+func snippet(s string) string {
+	const limit = 240
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(empty)"
+	}
+	r := []rune(s)
+	truncated := false
+	if len(r) > limit {
+		r, truncated = r[:limit], true
+	}
+	// Newlines and tabs would break the single-line warning format.
+	out := strings.NewReplacer("\n", "⏎", "\r", "", "\t", " ").Replace(string(r))
+	if truncated {
+		out += " …"
+	}
+	return strconv.Quote(out)
 }

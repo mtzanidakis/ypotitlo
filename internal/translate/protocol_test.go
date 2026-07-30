@@ -253,3 +253,73 @@ func TestUnusableTFieldSkipsTheLine(t *testing.T) {
 		t.Error("the usable entry was dropped along with the broken one")
 	}
 }
+
+func TestSnippet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, in, want string
+	}{
+		{"empty", "", "(empty)"},
+		{"whitespace only", "  \n\t ", "(empty)"},
+		{"plain prose", "I'm sorry, I can't help with that.", `"I'm sorry, I can't help with that."`},
+		{"newlines are flattened", "line one\nline two", `"line one⏎line two"`},
+		{"carriage returns are dropped", "a\r\nb", `"a⏎b"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := snippet(tt.in); got != tt.want {
+				t.Errorf("snippet(%q) = %s, want %s", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// A long reply is cut short: the point is to identify the shape of the failure,
+// not to reproduce the model's whole answer in a warning.
+func TestSnippetTruncates(t *testing.T) {
+	t.Parallel()
+
+	got := snippet(strings.Repeat("α", 1000))
+	if len([]rune(got)) > 300 {
+		t.Errorf("snippet is %d runes, too long to sit in a warning", len([]rune(got)))
+	}
+	// The marker sits inside the quoted text, so the whole value ends with the
+	// closing quote rather than the ellipsis.
+	if !strings.Contains(got, "…") {
+		t.Errorf("a truncated snippet should say so: %s", got)
+	}
+}
+
+// The debug seam stays silent unless a caller asks for it, so an ordinary run
+// is not littered with model output.
+func TestDebugIsOptOut(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(4)
+	p := &fakeProvider{fn: func(_ llm.Request, _ int) (llm.Response, error) {
+		return llm.Response{Content: "I cannot produce that."}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	if _, err := Run(context.Background(), in, o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var debugged []string
+	o.Debug = func(format string, a ...any) { debugged = append(debugged, fmt.Sprintf(format, a...)) }
+	if _, err := Run(context.Background(), in, o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(debugged) == 0 {
+		t.Fatal("no debug output when a reply could not be parsed")
+	}
+	// It has to carry the reply, which is the whole point.
+	joined := strings.Join(debugged, "\n")
+	if !strings.Contains(joined, "cannot produce") {
+		t.Errorf("debug output does not include the reply: %q", joined)
+	}
+}

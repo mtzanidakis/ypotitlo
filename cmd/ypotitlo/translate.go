@@ -202,6 +202,11 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		Phase:       ui.Phase,
 		Progress:    ui.Progress,
 	}
+	if f.verbose {
+		opts.Debug = func(format string, a ...any) {
+			ui.Suspend(func() { outf(e.Stderr, "debug: "+format+"\n", a...) })
+		}
+	}
 
 	// The overall deadline covers language detection too. It was created after
 	// it before, leaving one provider call bounded only by the HTTP client's own

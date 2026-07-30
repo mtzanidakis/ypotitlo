@@ -170,6 +170,13 @@ type Options struct {
 	// and the total. Serialised like Warn.
 	Progress func(done, total int)
 
+	// Debug receives detail that is only useful while diagnosing a failure —
+	// notably the text of a reply that could not be parsed. It is separate from
+	// Warn because a warning says what happened and this says what it looked
+	// like, which is noise on an ordinary run and the whole story on a bad one.
+	// Nil disables it. Serialised like Warn.
+	Debug func(format string, a ...any)
+
 	// Phase is called when the run moves to a new stage ("brief",
 	// "translating"), so a caller drawing a status line can say what is
 	// happening rather than leaving minutes of silence. Serialised like Warn.
@@ -398,6 +405,16 @@ func (r *runner) budget(n int) {
 	}
 	batches := (n + r.o.BatchSize - 1) / r.o.BatchSize
 	r.maxCalls = 3*batches + 10
+}
+
+// debug reports diagnostic detail, if the caller asked for it.
+func (r *runner) debug(format string, a ...any) {
+	if r.o.Debug == nil {
+		return
+	}
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.o.Debug(format, a...)
 }
 
 // phase reports a stage change to the caller, if it asked for them.
@@ -827,8 +844,10 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 			note = refusalNudge
 			r.bump(func(s *Stats) { s.Refusals += len(prep) })
 			r.warn("batch %d: model refused the whole batch; retrying once", job.id)
+			r.debug("batch %d: refusal read as: %s", job.id, snippet(resp.Content))
 		} else {
 			r.warn("batch %d: unparseable reply; retrying once at temperature 0", job.id)
+			r.debug("batch %d: reply began: %s", job.id, snippet(resp.Content))
 		}
 		r.bump(func(s *Stats) { s.Retries++ })
 

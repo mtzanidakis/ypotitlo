@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mtzanidakis/ypotitlo/internal/lang"
 	"github.com/mtzanidakis/ypotitlo/internal/llm"
@@ -43,6 +44,14 @@ const (
 	// levels turn a 20-cue batch into 5-cue batches, which is small enough that
 	// a third level would be diagnosing a broken model rather than a long reply.
 	maxSplitDepth = 2
+
+	// watchdogPoll is how often the stall watchdog looks at the clock.
+	watchdogPoll = 2 * time.Second
+
+	// defaultStallTimeout is how long a run may go without a single batch
+	// completing. Comfortably above the slowest observed batch on a reasoning
+	// model, and far below the time a hung connection would otherwise burn.
+	defaultStallTimeout = 6 * time.Minute
 
 	// maxConsecutiveFailures aborts a run whose calls have all stopped working.
 	// Set above the retries a single flaky batch can legitimately produce, and
@@ -85,6 +94,10 @@ const (
 // buy is a larger bill.
 var ErrCallBudget = errors.New("translate: call budget exhausted")
 
+// ErrStalled is returned when a run stops making progress, typically because a
+// request is hanging rather than failing.
+var ErrStalled = errors.New("translate: the run stopped making progress")
+
 // ErrProviderUnreachable is returned when calls stop working altogether.
 var ErrProviderUnreachable = errors.New("translate: the provider is not answering")
 
@@ -110,6 +123,13 @@ type Options struct {
 	// 3*ceil(cues/BatchSize)+10, which covers a brief, one repair per batch and
 	// a couple of splits.
 	MaxCalls int
+
+	// StallTimeout aborts the run when no batch has completed within it.
+	// 0 means defaultStallTimeout.
+	StallTimeout time.Duration
+
+	// Now is the clock the stall watchdog reads, injected for tests.
+	Now func() time.Time
 
 	// MaxUntranslatedRatio is the share of cues that may keep their original
 	// text before Run reports failure instead of a result. 0 means 0.5.
@@ -184,6 +204,7 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 		return Result{}, errors.New("translate: no model configured")
 	}
 
+	r.lastProgress = r.clock()
 	r.out = make([][]string, len(cues))
 	r.total = len(cues)
 	r.budget(len(cues))
@@ -245,6 +266,9 @@ type runner struct {
 	// consecutiveFailures drives the circuit breaker; see trip.
 	consecutiveFailures int
 	lastFailure         error
+
+	// lastProgress is when a batch last completed; see watchdog.
+	lastProgress time.Time
 }
 
 // nextSeed draws the sampling seed for one call.
@@ -399,6 +423,67 @@ func (g guarded) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 }
 
 // work runs the batches over o.Concurrency goroutines.
+// watchdog aborts the run when nothing has completed for StallTimeout.
+//
+// It watches progress rather than errors, which is what makes it catch the case
+// the circuit breaker cannot: a request that hangs returns neither a result nor
+// a failure, so a counter of failures stays at zero forever while the run sits
+// there. Any completed batch resets the clock, so a slow model is not mistaken
+// for a stuck one.
+func (r *runner) watchdog(ctx context.Context, fail func(error)) (stop func()) {
+	limit := r.o.StallTimeout
+	if limit <= 0 {
+		limit = defaultStallTimeout
+	}
+
+	// The poll interval is short and independent of the limit. Waking a few
+	// times a minute costs nothing, and tying it to the limit would make the
+	// watchdog's own responsiveness depend on the value being watched — which
+	// also makes it untestable without waiting out a real timeout.
+	interval := min(limit/4, watchdogPoll)
+
+	done := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if idle := r.idleFor(); idle >= limit {
+					fail(fmt.Errorf("%w: nothing completed for %s", ErrStalled, idle.Round(time.Second)))
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+// idleFor is how long it has been since a batch last completed.
+func (r *runner) idleFor() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.clock().Sub(r.lastProgress)
+}
+
+// markProgress restarts the watchdog's clock.
+func (r *runner) markProgress() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastProgress = r.clock()
+}
+
+func (r *runner) clock() time.Time {
+	if r.o.Now != nil {
+		return r.o.Now()
+	}
+	return time.Now()
+}
+
 func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -410,6 +495,14 @@ func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) 
 	fail := func(err error) {
 		once.Do(func() { fatal = err; cancel() })
 	}
+
+	// Watchdog. The circuit breaker counts failures, so it is blind to a call
+	// that never returns at all — and that is a real failure mode, not a
+	// theoretical one: an HTTP connection can sit ESTABLISHED and silent while
+	// the service itself is healthy. Progress, unlike error counts, is
+	// observable in every such case.
+	stop := r.watchdog(ctx, fail)
+	defer stop()
 
 	jobs := make(chan int)
 	workers := min(r.o.Concurrency, len(ranges))
@@ -424,6 +517,7 @@ func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) 
 					fail(err)
 					return
 				}
+				r.markProgress()
 				r.progress(ranges[i].end - ranges[i].start)
 			}
 		}()
@@ -783,6 +877,7 @@ func isFatal(err error) bool {
 		// The breaker only trips once calls have stopped working entirely, so
 		// carrying on would just fail every remaining batch in turn.
 		errors.Is(err, ErrProviderUnreachable) ||
+		errors.Is(err, ErrStalled) ||
 		errors.Is(err, llm.ErrAuth) ||
 		errors.Is(err, llm.ErrCreditExhausted) ||
 		errors.Is(err, llm.ErrBudgetExceeded)

@@ -20,6 +20,12 @@ import (
 type fakeProvider struct {
 	fn func(req llm.Request, n int) (llm.Response, error)
 
+	// fnCtx is the context-aware form, for tests that need to model a request
+	// which is in flight when the run is cancelled. A real HTTP call is
+	// cancellable; fn alone cannot express that, and a fake that ignores
+	// cancellation deadlocks the very tests that exercise it.
+	fnCtx func(ctx context.Context, req llm.Request, n int) (llm.Response, error)
+
 	mu   sync.Mutex
 	reqs []llm.Request
 }
@@ -34,6 +40,9 @@ func (f *fakeProvider) Complete(ctx context.Context, req llm.Request) (llm.Respo
 	f.reqs = append(f.reqs, req)
 	n := len(f.reqs)
 	f.mu.Unlock()
+	if f.fnCtx != nil {
+		return f.fnCtx(ctx, req, n)
+	}
 	return f.fn(req, n)
 }
 

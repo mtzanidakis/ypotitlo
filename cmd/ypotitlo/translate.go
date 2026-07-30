@@ -347,6 +347,8 @@ func classifyRunError(err error, keySource string) error {
 		return &codedError{exitAuth, err}
 	case errors.Is(err, llm.ErrBudgetExceeded):
 		return &codedError{exitBudget, fmt.Errorf("%w; raise it with -budget or 'ypotitlo config-set max_spend_usd'", err)}
+	case errors.Is(err, translate.ErrStalled):
+		return &codedError{exitError, fmt.Errorf("%w; the connection was open but silent, so nothing was written", err)}
 	case errors.Is(err, translate.ErrProviderUnreachable):
 		return &codedError{exitError, fmt.Errorf("%w; check your network and try again", err)}
 	case errors.Is(err, translate.ErrMostlyUntranslated):

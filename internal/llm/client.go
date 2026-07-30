@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +88,10 @@ type Config struct {
 	ExtraHeaders map[string]string
 	Budget       *BudgetGuard
 	HTTP         *http.Client
+	// RequestTimeout bounds one HTTP exchange. 0 means DefaultRequestTimeout.
+	// Ignored when HTTP is supplied.
+	RequestTimeout time.Duration
+
 	// Retries429 and RetriesOther override the per-class retry budgets.
 	Retries429   int
 	RetriesOther int
@@ -97,6 +102,33 @@ type Config struct {
 	Rand *rand.Rand
 }
 
+// DefaultRequestTimeout bounds a single HTTP exchange. Generous, because a
+// reasoning model thinking about a batch of subtitles genuinely takes minutes.
+const DefaultRequestTimeout = 4 * time.Minute
+
+// newTransport builds the HTTP transport, deliberately on HTTP/1.1.
+//
+// The default transport negotiates HTTP/2, which multiplexes every concurrent
+// worker onto a single TCP connection. Go's HTTP/2 sends no keepalive pings
+// unless configured to, so a connection that dies without a FIN — a dropped NAT
+// entry, a silently restarted proxy — stays ESTABLISHED and every request
+// queued behind it waits. Observed exactly that: one socket with both queues
+// empty, four workers idle, twenty-nine minutes of silence, no error, while the
+// service answered curl normally throughout.
+//
+// Keeping HTTP/2 and enabling its pings would mean importing
+// golang.org/x/net/http2. HTTP/2 buys this client nothing — a few dozen
+// requests spread over minutes — so the multiplexing is dropped instead of
+// repaired. One connection per in-flight request means a stuck request stalls
+// only itself, and the client's own Timeout bounds it.
+func newTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	// A non-nil empty map is the documented way to refuse the h2 upgrade.
+	t.ForceAttemptHTTP2 = false
+	t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	return t
+}
+
 // NewClient builds a chat client from cfg.
 func NewClient(cfg Config) *Client {
 	now := cfg.Now
@@ -105,8 +137,11 @@ func NewClient(cfg Config) *Client {
 	}
 	hc := cfg.HTTP
 	if hc == nil {
-		// LLM generations routinely run past a minute; use a generous timeout.
-		hc = &http.Client{Timeout: 5 * time.Minute}
+		timeout := cfg.RequestTimeout
+		if timeout == 0 {
+			timeout = DefaultRequestTimeout
+		}
+		hc = &http.Client{Timeout: timeout, Transport: newTransport()}
 	}
 	sleep := cfg.Sleep
 	if sleep == nil {

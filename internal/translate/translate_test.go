@@ -7,8 +7,10 @@ import (
 	"math/rand"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mtzanidakis/ypotitlo/internal/llm"
 	"github.com/mtzanidakis/ypotitlo/internal/srt"
@@ -1031,4 +1033,98 @@ func TestSmallFilesAreExemptFromTheRatioCheck(t *testing.T) {
 	if _, err := Run(context.Background(), in, o); err != nil {
 		t.Fatalf("a %d-cue file must not trip the ratio check: %v", len(in), err)
 	}
+}
+
+// TestRunAbortsWhenCallsHangRatherThanFail covers the gap the circuit breaker
+// cannot see.
+//
+// The breaker counts failures, so a request that never returns leaves it at
+// zero forever. That is not hypothetical: an HTTP/2 connection was observed
+// sitting ESTABLISHED with empty queues for twenty-nine minutes while the
+// service answered curl normally, and the run neither progressed nor failed.
+// The watchdog measures progress instead, which is observable either way.
+func TestRunAbortsWhenCallsHangRatherThanFail(t *testing.T) {
+	t.Parallel()
+
+	// A clock the test advances itself, so no wall time passes.
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		now = now.Add(d)
+		mu.Unlock()
+	}
+
+	// Hang until the run is cancelled, the way an in-flight request on a dead
+	// connection does.
+	p := &fakeProvider{fnCtx: func(ctx context.Context, _ llm.Request, _ int) (llm.Response, error) {
+		<-ctx.Done()
+		return llm.Response{}, ctx.Err()
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Now = clock
+	o.StallTimeout = time.Minute
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), makeCues(40), o)
+		done <- err
+	}()
+
+	// Let the watchdog observe a clock well past the stall limit.
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrStalled) {
+				t.Fatalf("Run error = %v, want ErrStalled", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("the watchdog never fired; a hung run must not wait forever")
+		default:
+			advance(30 * time.Second)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}
+
+// A slow but working run must not be mistaken for a stuck one: every completed
+// batch restarts the clock.
+func TestSlowProgressDoesNotTripTheWatchdog(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+
+	p := &fakeProvider{fn: func(req llm.Request, _ int) (llm.Response, error) {
+		// Each call takes most of the stall budget, but never all of it.
+		mu.Lock()
+		now = now.Add(40 * time.Second)
+		mu.Unlock()
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	o.Now = clock
+	o.StallTimeout = time.Minute
+	o.Concurrency = 1
+
+	in := makeCues(100)
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("a slow run must not be killed: %v", err)
+	}
+	assertShape(t, in, res.Cues)
 }

@@ -1,0 +1,713 @@
+// Package translate turns a parsed subtitle file into another language.
+//
+// The contract with the caller is narrow and absolute: the result has exactly
+// as many cues as the input, in the same order, with Index, Start and End
+// untouched. Only Lines ever change, and a cue that could not be translated
+// keeps its original lines, is counted in Stats.Untranslated and produces a
+// warning. There is no path through this package that drops, merges, reorders
+// or re-times a cue — a subtitle file that has been silently de-synchronised is
+// worse than no translation at all, because nothing about it looks wrong until
+// it is played.
+//
+// The pipeline is:
+//
+//	pass 0   one call over the whole file for a translation brief (brief.go)
+//	batching scene-aware grouping with ±3 source cues of context (batch.go)
+//	batches  JSON Lines request/response, run concurrently (protocol.go)
+//	repair   four failure causes, four distinct responses (see runBatch)
+//
+// Every failure mode ends in "fall back and warn" rather than an error, so
+// Options.Warn is the seam the tests are written against. Nothing in this
+// package writes to os.Stderr.
+package translate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/mtzanidakis/ypotitlo/internal/lang"
+	"github.com/mtzanidakis/ypotitlo/internal/llm"
+	"github.com/mtzanidakis/ypotitlo/internal/srt"
+)
+
+const (
+	defaultBatchSize   = 20
+	defaultConcurrency = 2
+
+	// maxSplitDepth bounds the recursion when a batch has to be halved. Two
+	// levels turn a 20-cue batch into 5-cue batches, which is small enough that
+	// a third level would be diagnosing a broken model rather than a long reply.
+	maxSplitDepth = 2
+
+	// reasoningEffort is set low because half of the models this tool can reach
+	// are reasoning models, and a reasoning model asked to translate twenty
+	// subtitle lines will happily spend its entire output budget deliberating
+	// and return nothing.
+	reasoningEffort = "low"
+
+	// tempNormal is low enough for format compliance and high enough that the
+	// model still writes idiomatic dialogue. tempStrict is used for repair
+	// calls, where only compliance matters.
+	tempNormal = 0.25
+	tempStrict = 0.0
+)
+
+// ErrCallBudget is returned when a run would exceed Options.MaxCalls.
+//
+// It is a fuse, not a retry policy: a run that has already spent three times
+// its expected number of calls is not converging, and the only thing more calls
+// buy is a larger bill.
+var ErrCallBudget = errors.New("translate: call budget exhausted")
+
+// Options configures a run.
+type Options struct {
+	Provider llm.Provider
+	Model    string
+
+	// Source is the language of the input. The zero value means unknown, which
+	// is a supported and common case: modern models detect it perfectly well
+	// from the text, and naming it wrongly is worse than not naming it.
+	Source lang.Lang
+	Target lang.Lang
+
+	BatchSize   int // cues per batch; 0 means 20
+	Concurrency int // concurrent batches; 0 means 2
+
+	// MaxCalls is the hard fuse on provider calls for the whole run. 0 means
+	// 3*ceil(cues/BatchSize)+10, which covers a brief, one repair per batch and
+	// a couple of splits.
+	MaxCalls int
+
+	// Brief enables pass 0 (see brief.go). Note that the zero value is false:
+	// callers that want the brief must ask for it. The command line asks for it
+	// by default.
+	Brief bool
+
+	// Rand seeds the per-call sampling seed, injected so that a test sees a
+	// reproducible request stream.
+	Rand *rand.Rand
+
+	// Warn receives every recoverable problem. It is the only output channel
+	// this package has; it never writes to a stream of its own. It may be
+	// called from several goroutines, but calls are serialised.
+	Warn func(format string, a ...any)
+
+	// Progress is called as batches complete, with the number of cues finished
+	// and the total. Serialised like Warn.
+	Progress func(done, total int)
+}
+
+// Stats is the accounting for one run.
+type Stats struct {
+	Calls           int // provider calls made, including the brief and repairs
+	Retries         int // repair calls: strict retries, re-requests, refusal retries
+	ProviderRetries int // HTTP-level retries the llm client reported
+	Splits          int // batches halved after a truncated reply
+	Batches         int
+	Untranslated    int // cues returned in their original language
+	Refusals        int // cues the model declined at least once
+
+	PromptTokens     int
+	CompletionTokens int
+	CostUSD          float64
+	UnknownCost      int // calls whose model has no published price
+}
+
+// Result is the outcome of a run.
+type Result struct {
+	// Cues has the same length and order as the input, with Start, End and
+	// Index untouched. On error it is nil.
+	Cues     []srt.Cue
+	Brief    *Brief
+	Stats    Stats
+	Warnings []string
+}
+
+// Run translates cues into o.Target.
+//
+// It returns an error only for conditions no fallback can survive: a missing
+// provider or target, an exhausted call budget, a rejected API key, an
+// exhausted account, or a cancelled context. Everything else — a truncated
+// reply, a malformed line, a refused cue, mangled markup, a failed brief — is
+// handled, warned about, and reflected in Stats.
+func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
+	r := newRunner(o)
+
+	// An empty file is not an error and must not cost a single call.
+	if len(cues) == 0 {
+		return Result{Cues: []srt.Cue{}}, nil
+	}
+	if o.Provider == nil {
+		return Result{}, errors.New("translate: no provider configured")
+	}
+	if o.Target.Zero() {
+		return Result{}, errors.New("translate: no target language")
+	}
+	if o.Model == "" {
+		return Result{}, errors.New("translate: no model configured")
+	}
+
+	r.out = make([][]string, len(cues))
+	r.total = len(cues)
+	r.budget(len(cues))
+
+	brief := r.makeBrief(ctx, cues)
+	r.sys = systemPrompt(o.Source, o.Target, brief)
+
+	ranges := planBatches(cues, r.o.BatchSize)
+	r.stats.Batches = len(ranges)
+
+	if err := r.work(ctx, cues, ranges); err != nil {
+		return Result{Stats: r.snapshot(), Warnings: r.warningList(), Brief: brief}, err
+	}
+
+	return Result{
+		Cues:     r.assemble(cues),
+		Brief:    brief,
+		Stats:    r.snapshot(),
+		Warnings: r.warningList(),
+	}, nil
+}
+
+// runner holds the mutable state of one run.
+type runner struct {
+	o        Options
+	sys      string
+	maxCalls int
+	total    int
+
+	// out[i] is the translated text of cue i, or nil to keep the original.
+	// Batches own disjoint index ranges, so workers never touch the same slot.
+	out [][]string
+
+	mu       sync.Mutex
+	stats    Stats
+	warnings []string
+	done     int
+}
+
+// nextSeed draws the sampling seed for one call.
+//
+// Every call gets its own, from the injected source, for two reasons. Tests
+// need the request stream to be reproducible. And a strict retry runs at
+// temperature 0, so re-using the previous call's seed would ask the model to
+// reproduce, as exactly as it can, the malformed reply that caused the retry.
+func (r *runner) nextSeed() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.o.Rand.Intn(1 << 30)
+}
+
+func newRunner(o Options) *runner {
+	if o.BatchSize <= 0 {
+		o.BatchSize = defaultBatchSize
+	}
+	if o.Concurrency <= 0 {
+		o.Concurrency = defaultConcurrency
+	}
+	if o.Rand == nil {
+		o.Rand = rand.New(rand.NewSource(1))
+	}
+	return &runner{o: o}
+}
+
+// budget sets the call fuse for a run of n cues.
+func (r *runner) budget(n int) {
+	if r.o.MaxCalls > 0 {
+		r.maxCalls = r.o.MaxCalls
+		return
+	}
+	batches := (n + r.o.BatchSize - 1) / r.o.BatchSize
+	r.maxCalls = 3*batches + 10
+}
+
+func (r *runner) warn(format string, a ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warnings = append(r.warnings, fmt.Sprintf(format, a...))
+	if r.o.Warn != nil {
+		r.o.Warn(format, a...)
+	}
+}
+
+// reserve claims one call against the fuse.
+func (r *runner) reserve() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.maxCalls > 0 && r.stats.Calls >= r.maxCalls {
+		return fmt.Errorf("%w: %d calls", ErrCallBudget, r.stats.Calls)
+	}
+	r.stats.Calls++
+	return nil
+}
+
+// record folds one response into the run accounting. It is called for failed
+// calls too: a call that errored after three HTTP retries still cost money.
+func (r *runner) record(resp llm.Response) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stats.ProviderRetries += resp.Retries
+	r.stats.PromptTokens += resp.Usage.PromptTokens
+	r.stats.CompletionTokens += resp.Usage.CompletionTokens
+	if resp.Usage.CostKnown {
+		r.stats.CostUSD += resp.Usage.CostUSD
+	} else if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+		r.stats.UnknownCost++
+	}
+}
+
+func (r *runner) bump(f func(s *Stats)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f(&r.stats)
+}
+
+func (r *runner) snapshot() Stats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stats
+}
+
+func (r *runner) warningList() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.warnings)
+}
+
+func (r *runner) progress(n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done += n
+	if r.o.Progress != nil {
+		r.o.Progress(r.done, r.total)
+	}
+}
+
+// call performs one provider call under the fuse.
+func (r *runner) call(ctx context.Context, req llm.Request) (llm.Response, error) {
+	if err := r.reserve(); err != nil {
+		return llm.Response{}, err
+	}
+	resp, err := r.o.Provider.Complete(ctx, req)
+	r.record(resp)
+	return resp, err
+}
+
+// guarded is the runner's provider seen as an llm.Provider, so that helpers
+// which may make more than one call — llm.CompleteJSON does exactly that when
+// it repairs malformed JSON — are still counted and still fused.
+type guarded struct{ r *runner }
+
+func (g guarded) Name() string { return g.r.o.Provider.Name() }
+
+func (g guarded) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
+	return g.r.call(ctx, req)
+}
+
+// work runs the batches over o.Concurrency goroutines.
+func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		once  sync.Once
+		fatal error
+	)
+	fail := func(err error) {
+		once.Do(func() { fatal = err; cancel() })
+	}
+
+	jobs := make(chan int)
+	workers := min(r.o.Concurrency, len(ranges))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if err := r.runBatch(ctx, cues, ranges[i], i+1); err != nil {
+					fail(err)
+					return
+				}
+				r.progress(ranges[i].end - ranges[i].start)
+			}
+		}()
+	}
+
+	for i := range ranges {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if fatal != nil {
+		return fatal
+	}
+	// A cancellation that no worker reported still has to be an error: the
+	// caller must never mistake a half-translated file for a finished one.
+	return ctx.Err()
+}
+
+// assemble builds the output cues. Timings and indices come from the input
+// unchanged; Lines are cloned so that the result never aliases the input.
+func (r *runner) assemble(cues []srt.Cue) []srt.Cue {
+	out := make([]srt.Cue, len(cues))
+	for i, c := range cues {
+		out[i] = c
+		if r.out[i] != nil {
+			out[i].Lines = r.out[i]
+		} else {
+			out[i].Lines = slices.Clone(c.Lines)
+		}
+	}
+	return out
+}
+
+// prepared is one cue on its way to the model.
+type prepared struct {
+	idx   int         // index into the input cues
+	id    int         // batch-local id, 1..N
+	parts []lineParts // one per source line, in order
+	core  []int       // indices into parts of the lines that carry text
+	src   []string    // the text actually sent, one per core line
+}
+
+func (p *prepared) n() int { return len(p.src) }
+
+// prepare decomposes a range of cues. Cues with no translatable text — empty
+// cues, whitespace-only cues, cues that are nothing but an ASS override — are
+// left out of the batch entirely rather than being sent as empty strings and
+// counted as failures when nothing comes back.
+func (r *runner) prepare(cues []srt.Cue, br batchRange) []*prepared {
+	var out []*prepared
+	for i := br.start; i < br.end; i++ {
+		p := &prepared{idx: i}
+		for _, line := range cues[i].Lines {
+			lp := splitLine(line)
+			if len(lp.mid) > 0 {
+				r.warn("cue %d: %d ASS override block(s) inside the text will be re-attached at the end of the line",
+					i+1, len(lp.mid))
+			}
+			if lp.core != "" {
+				p.core = append(p.core, len(p.parts))
+				p.src = append(p.src, lp.core)
+			}
+			p.parts = append(p.parts, lp)
+		}
+		if p.n() == 0 {
+			continue
+		}
+		p.id = len(out) + 1
+		out = append(out, p)
+	}
+	return out
+}
+
+// runBatch translates one batch. It returns an error only for fatal conditions.
+func (r *runner) runBatch(ctx context.Context, cues []srt.Cue, br batchRange, id int) error {
+	prep := r.prepare(cues, br)
+	if len(prep) == 0 {
+		return nil
+	}
+	job := batchJob{
+		id:     id,
+		before: contextText(cues, max(0, br.start-contextCues), br.start),
+		after:  contextText(cues, br.end, min(len(cues), br.end+contextCues)),
+	}
+	return r.translateGroup(ctx, job, prep, 0)
+}
+
+// batchJob is the read-only context around a group of cues.
+type batchJob struct {
+	id     int
+	before []string
+	after  []string
+}
+
+func contextText(cues []srt.Cue, from, to int) []string {
+	var out []string
+	for i := from; i < to; i++ {
+		if s := strings.TrimSpace(strings.Join(cues[i].Lines, " ")); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// translateGroup is the failure-classification machine.
+//
+// Four causes get four responses, and the distinction is the whole point. A
+// single "retry once, then split in half" rule costs 4N-2 calls in the worst
+// case — thousands of calls for one feature film — and applies the most
+// expensive remedy to the cheapest problem.
+//
+//	truncated reply    split immediately, no retry. Re-asking for the same
+//	                   number of cues with the same token ceiling is certain to
+//	                   truncate again, so the retry is pure waste.
+//	nothing parseable  one strict retry at temperature 0 naming the violation.
+//	partial reply      re-request only the missing ids, with the whole batch
+//	                   still visible as context. With JSON Lines this is the
+//	                   ordinary path, and it is strictly better than halving:
+//	                   fewer calls, and the cues that did arrive are not
+//	                   translated a second time.
+//	refusal            one retry for the refused cues only, saying what the
+//	                   material is. Then keep the original and warn.
+func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepared, depth int) error {
+	got := make(map[int]entry, len(prep))
+	skipped := 0
+
+	resp, err := r.call(ctx, r.request(job, prep, prep, "", false))
+	switch {
+	case isFatal(err):
+		return err
+	case truncated(resp, err):
+		return r.splitGroup(ctx, job, prep, depth, "the reply hit the output-token limit")
+	case err != nil:
+		r.warn("batch %d: call failed: %v", job.id, err)
+	default:
+		parsed, n := parseJSONL(resp.Content)
+		skipped = n
+		merge(got, parsed, prep, false)
+	}
+
+	// Cause 2 and cause 4: nothing usable came back at all.
+	if len(got) == 0 {
+		note := "your previous reply contained no JSON object lines at all"
+		if skipped > 0 {
+			note = fmt.Sprintf("your previous reply had %d line(s) that were not a JSON object matching the required shape, and no usable ones", skipped)
+		}
+		if err == nil && looksRefusal(resp.Content) {
+			note = refusalNudge
+			r.bump(func(s *Stats) { s.Refusals += len(prep) })
+			r.warn("batch %d: model refused the whole batch; retrying once", job.id)
+		} else {
+			r.warn("batch %d: unparseable reply; retrying once at temperature 0", job.id)
+		}
+		r.bump(func(s *Stats) { s.Retries++ })
+
+		resp2, err2 := r.call(ctx, r.request(job, prep, prep, note, true))
+		switch {
+		case isFatal(err2):
+			return err2
+		case truncated(resp2, err2):
+			return r.splitGroup(ctx, job, prep, depth, "the retry hit the output-token limit")
+		case err2 != nil:
+			r.warn("batch %d: retry failed: %v", job.id, err2)
+		default:
+			parsed, _ := parseJSONL(resp2.Content)
+			merge(got, parsed, prep, false)
+		}
+	}
+
+	// Cause 3: some cues came back and some did not.
+	if missing := pick(prep, func(p *prepared) bool { _, ok := got[p.id]; return !ok }); len(missing) > 0 && len(got) > 0 {
+		r.warn("batch %d: %d of %d cues missing from the reply; re-requesting only those",
+			job.id, len(missing), len(prep))
+		r.bump(func(s *Stats) { s.Retries++ })
+
+		note := fmt.Sprintf("Your previous reply omitted %d of the cues. Return ONLY the cue ids listed below, one JSON object per line.", len(missing))
+		resp3, err3 := r.call(ctx, r.request(job, prep, missing, note, true))
+		switch {
+		case isFatal(err3):
+			return err3
+		case err3 != nil:
+			r.warn("batch %d: re-request failed: %v", job.id, err3)
+		default:
+			parsed, _ := parseJSONL(resp3.Content)
+			merge(got, parsed, missing, false)
+		}
+	}
+
+	// Cause 4 again, at cue granularity this time.
+	if refused := pick(prep, func(p *prepared) bool { e, ok := got[p.id]; return ok && e.refused() }); len(refused) > 0 {
+		r.bump(func(s *Stats) { s.Refusals += len(refused); s.Retries++ })
+		r.warn("batch %d: %d cue(s) refused; retrying them once", job.id, len(refused))
+
+		resp4, err4 := r.call(ctx, r.request(job, prep, refused, refusalNudge, true))
+		switch {
+		case isFatal(err4):
+			return err4
+		case err4 != nil:
+			r.warn("batch %d: refusal retry failed: %v", job.id, err4)
+		default:
+			// override: the entries already held for these ids are refusals.
+			parsed, _ := parseJSONL(resp4.Content)
+			merge(got, parsed, refused, true)
+		}
+	}
+
+	r.apply(job, prep, got)
+	return nil
+}
+
+// splitGroup halves a group after a truncated reply.
+func (r *runner) splitGroup(ctx context.Context, job batchJob, prep []*prepared, depth int, why string) error {
+	if depth >= maxSplitDepth || len(prep) < 2 {
+		r.warn("batch %d: %s and the batch cannot be split further; %d cue(s) left untranslated",
+			job.id, why, len(prep))
+		r.fallback(prep)
+		return nil
+	}
+	r.bump(func(s *Stats) { s.Splits++ })
+	r.warn("batch %d: %s; splitting %d cues into two", job.id, why, len(prep))
+
+	mid := len(prep) / 2
+	left, right := prep[:mid], prep[mid:]
+
+	// Each half becomes the other's context, so splitting never costs the
+	// continuity the ±3 window was there to provide.
+	leftJob := batchJob{id: job.id, before: job.before, after: headText(right, contextCues)}
+	rightJob := batchJob{id: job.id, before: tailText(left, contextCues), after: job.after}
+
+	if err := r.translateGroup(ctx, leftJob, left, depth+1); err != nil {
+		return err
+	}
+	return r.translateGroup(ctx, rightJob, right, depth+1)
+}
+
+// apply validates every reply entry and writes the cues that survived.
+func (r *runner) apply(job batchJob, prep []*prepared, got map[int]entry) {
+	for _, p := range prep {
+		e, ok := got[p.id]
+		switch {
+		case !ok:
+			r.warn("batch %d: cue %d never came back; keeping the original", job.id, p.idx+1)
+			r.fallback([]*prepared{p})
+			continue
+		case e.refused():
+			r.warn("batch %d: cue %d refused after a retry; keeping the original", job.id, p.idx+1)
+			r.fallback([]*prepared{p})
+			continue
+		case e.blank():
+			r.warn("batch %d: cue %d came back empty; keeping the original", job.id, p.idx+1)
+			r.fallback([]*prepared{p})
+			continue
+		}
+
+		text := []string(e.T)
+		if len(text) != p.n() {
+			// The line count is the protocol invariant that makes whitespace
+			// re-attachment sound. Do not index into a reply of the wrong
+			// length: re-wrap it ourselves and say so.
+			r.warn("batch %d: cue %d came back as %d line(s) for a %d-line cue; re-split",
+				job.id, p.idx+1, len(text), p.n())
+			text = balancedSplit(strings.Join(text, " "), p.n())
+		}
+
+		if !sameTags(p.src, text) {
+			r.warn("batch %d: cue %d lost or invented markup (%s vs %s); keeping the original",
+				job.id, p.idx+1, tagList(p.src), tagList(text))
+			r.fallback([]*prepared{p})
+			continue
+		}
+
+		out := make([]string, len(p.parts))
+		for i, lp := range p.parts {
+			out[i] = lp.rebuild("")
+		}
+		for k, li := range p.core {
+			out[li] = p.parts[li].rebuild(strings.TrimSpace(text[k]))
+		}
+		r.out[p.idx] = out
+	}
+}
+
+// fallback records cues that keep their original text. The cue is left as nil
+// in r.out, which assemble reads as "clone the input lines".
+func (r *runner) fallback(prep []*prepared) {
+	r.bump(func(s *Stats) { s.Untranslated += len(prep) })
+}
+
+// merge folds parsed entries into got, accepting only ids that were actually
+// requested. want is the set the call asked for; override says whether an entry
+// already present may be replaced (true only for the refusal retry, where the
+// entry being replaced is the refusal itself).
+func merge(got map[int]entry, parsed map[int]entry, want []*prepared, override bool) {
+	allowed := make(map[int]bool, len(want))
+	for _, p := range want {
+		allowed[p.id] = true
+	}
+	for id, e := range parsed {
+		if !allowed[id] {
+			continue
+		}
+		if _, exists := got[id]; exists && !override {
+			continue
+		}
+		got[id] = e
+	}
+}
+
+func pick(prep []*prepared, keep func(*prepared) bool) []*prepared {
+	var out []*prepared
+	for _, p := range prep {
+		if keep(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// truncated reports the one failure that must never be retried at the same
+// size. The client surfaces it two ways: as ErrTruncated when the truncated
+// reply was empty, and as a successful response carrying FinishLength when it
+// was not.
+func truncated(resp llm.Response, err error) bool {
+	return errors.Is(err, llm.ErrTruncated) || resp.FinishReason == llm.FinishLength
+}
+
+// isFatal reports the errors no fallback can survive.
+func isFatal(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrCallBudget) ||
+		errors.Is(err, llm.ErrAuth) ||
+		errors.Is(err, llm.ErrCreditExhausted) ||
+		errors.Is(err, llm.ErrBudgetExceeded)
+}
+
+func headText(prep []*prepared, n int) []string {
+	var out []string
+	for _, p := range prep[:min(n, len(prep))] {
+		out = append(out, strings.Join(p.src, " "))
+	}
+	return out
+}
+
+func tailText(prep []*prepared, n int) []string {
+	var out []string
+	for _, p := range prep[max(0, len(prep)-n):] {
+		out = append(out, strings.Join(p.src, " "))
+	}
+	return out
+}
+
+func tagList(lines []string) string {
+	m := tagMultiset(strings.Join(lines, "\n"))
+	if len(m) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(m))
+	for k, v := range m {
+		keys = append(keys, fmt.Sprintf("%s×%d", k, v))
+	}
+	slices.Sort(keys)
+	return strings.Join(keys, " ")
+}
+
+func ptr[T any](v T) *T { return &v }

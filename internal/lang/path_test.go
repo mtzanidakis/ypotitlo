@@ -218,3 +218,88 @@ func TestResolvesAsLanguage(t *testing.T) {
 func native(p string) string {
 	return strings.ReplaceAll(p, "/", string(filepath.Separator))
 }
+
+func TestFromFilename(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string // "" means no language should be found
+	}{
+		{"plain code", "movie.en.srt", "en"},
+		{"three letter bibliographic", "movie.gre.srt", "el"},
+		{"three letter terminological", "movie.ell.srt", "el"},
+		{"uppercase", "movie.EN.srt", "en"},
+		{"marker after the code", "movie.eng.sdh.srt", "en"},
+		{"several markers", "movie.en.forced.hi.srt", "en"},
+		{"full path", native("/tmp/films/movie.fr.srt"), "fr"},
+		{"other extension", "movie.de.vtt", "de"},
+
+		// The whole reason the marker table is peeled first: each of these
+		// parses as a language on its own.
+		{"bare sdh is a track type", "movie.sdh.srt", ""},
+		{"bare hi is hearing impaired", "movie.hi.srt", ""},
+		{"bare cc is a track type", "movie.cc.srt", ""},
+
+		{"no language segment", "movie.srt", ""},
+		{"year is not a language", "movie.2024.srt", ""},
+		{"episode code is not a language", "s01e01.srt", ""},
+		{"resolution is not a language", "movie.1080p.srt", ""},
+		{"bare stem", "movie", ""},
+		{"language alone would leave no stem", "en.srt", ""},
+		{"empty", "", ""},
+		{"stdin sentinel", "-", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := FromFilename(tt.in)
+			if tt.want == "" {
+				if ok {
+					t.Errorf("FromFilename(%q) = %q, want no match", tt.in, got.Code)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("FromFilename(%q) found nothing, want %q", tt.in, tt.want)
+			}
+			if got.Code != tt.want {
+				t.Errorf("FromFilename(%q) = %q, want %q", tt.in, got.Code, tt.want)
+			}
+		})
+	}
+}
+
+// TestFromFilenameAgreesWithDerivation is the point of exporting FromFilename:
+// detection and output-path derivation must classify a trailing segment the
+// same way. If they disagree, movie.en.sdh.srt is read as Southern Kurdish by
+// one and as English-plus-a-marker by the other.
+func TestFromFilenameAgreesWithDerivation(t *testing.T) {
+	t.Parallel()
+
+	greek, err := Resolve("el")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	for _, in := range []string{
+		"movie.en.srt", "movie.eng.sdh.srt", "movie.sdh.srt", "movie.hi.srt",
+		"movie.srt", "movie.2024.srt", "movie.en.forced.srt",
+	} {
+		out, err := DeriveOutputPath(in, greek)
+		if err != nil {
+			t.Fatalf("DeriveOutputPath(%q): %v", in, err)
+		}
+		// Whatever derivation produced must itself read back as Greek.
+		got, ok := FromFilename(out)
+		if !ok {
+			t.Errorf("DeriveOutputPath(%q) = %q, which FromFilename does not recognise", in, out)
+			continue
+		}
+		if got.Code != "el" {
+			t.Errorf("DeriveOutputPath(%q) = %q, read back as %q, want el", in, out, got.Code)
+		}
+	}
+}

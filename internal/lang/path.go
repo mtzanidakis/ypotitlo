@@ -121,6 +121,42 @@ func DeriveOutputPath(in string, target Lang) (string, error) {
 	return dir + strings.Join(segs, ".") + ext, nil
 }
 
+// FromFilename reads the language out of a subtitle filename: movie.en.srt or
+// movie.eng.sdh.srt both yield English.
+//
+// It exists so that language *detection* and output-path *derivation* share one
+// marker table. Two copies of that table would drift, and a segment classified
+// as a marker here but as a language there is exactly how movie.en.sdh.srt ends
+// up translated from Southern Kurdish.
+func FromFilename(path string) (Lang, bool) {
+	if path == "" || path == "-" {
+		return Lang{}, false
+	}
+
+	base := filepath.Base(path)
+	if ext := filepath.Ext(base); ext != "" {
+		base = base[:len(base)-len(ext)]
+	}
+
+	segs := strings.Split(base, ".")
+	for len(segs) > 1 && markerSet[strings.ToLower(segs[len(segs)-1])] {
+		segs = segs[:len(segs)-1]
+	}
+	if len(segs) < 2 {
+		return Lang{}, false
+	}
+
+	seg := segs[len(segs)-1]
+	if !resolvesAsLanguage(seg) {
+		return Lang{}, false
+	}
+	l, err := Resolve(seg)
+	if err != nil {
+		return Lang{}, false
+	}
+	return l, true
+}
+
 // resolvesAsLanguage reports whether a filename segment is a language code.
 //
 // All four conditions are load-bearing. The length bound rejects words;

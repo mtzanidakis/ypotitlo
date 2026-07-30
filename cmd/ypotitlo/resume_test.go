@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mtzanidakis/ypotitlo/internal/srt"
+	"github.com/mtzanidakis/ypotitlo/internal/translate"
 )
 
 const resumeSource = `1
@@ -155,5 +156,88 @@ func TestPlanResumeWithoutAPreviousOutput(t *testing.T) {
 	_, err := planResume(in, filepath.Join(dir, "absent.el.srt"), "", parseString(t, resumeSource))
 	if err == nil || !strings.Contains(err.Error(), "previous output") {
 		t.Errorf("err = %v, want it to name the missing previous output", err)
+	}
+}
+
+// The brief is parked beside a partial file and picked up by the resume, so
+// pass 0 — a minute and some fifteen thousand tokens — is not paid twice.
+func TestBriefCacheRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "movie.el.srt")
+	cues := parseString(t, resumeSource).Cues
+	b := &translate.Brief{
+		Tone:       "wry",
+		Characters: []translate.BriefCharacter{{Name: "Rupert", Rendered: "Ρούπερτ", Gender: "male"}},
+	}
+
+	if err := saveBrief(out, "el", cues, b); err != nil {
+		t.Fatalf("saveBrief: %v", err)
+	}
+	got := loadBrief(out, "el", cues)
+	if got == nil {
+		t.Fatal("the cached brief was not found")
+	}
+	if got.Tone != "wry" || len(got.Characters) != 1 || got.Characters[0].Rendered != "Ρούπερτ" {
+		t.Errorf("cached brief came back wrong: %+v", got)
+	}
+
+	dropBrief(out)
+	if loadBrief(out, "el", cues) != nil {
+		t.Error("the cache survived being dropped")
+	}
+}
+
+// A cache is only used for the subtitle and the language it was written for.
+func TestBriefCacheIsScopedToTheFilmAndLanguage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "movie.el.srt")
+	cues := parseString(t, resumeSource).Cues
+	if err := saveBrief(out, "el", cues, &translate.Brief{Tone: "wry"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if loadBrief(out, "es", cues) != nil {
+		t.Error("a brief written for Greek was used for Spanish")
+	}
+
+	other := parseString(t, strings.Replace(resumeSource, "Hello there.", "Something else.", 1)).Cues
+	if loadBrief(out, "el", other) != nil {
+		t.Error("a brief written for one subtitle was used for another")
+	}
+}
+
+// A missing or corrupt cache is simply no cache: the brief is an optimisation,
+// and recomputing it is always correct.
+func TestBriefCacheFailsSoft(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "movie.el.srt")
+	cues := parseString(t, resumeSource).Cues
+
+	if loadBrief(out, "el", cues) != nil {
+		t.Error("found a brief where none was written")
+	}
+	if err := os.WriteFile(briefCachePath(out), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if loadBrief(out, "el", cues) != nil {
+		t.Error("a corrupt cache was used")
+	}
+	dropBrief(out) // must not fail on a file it cannot parse
+}
+
+// The cache sits beside the output, hidden, and is named after it.
+func TestBriefCachePath(t *testing.T) {
+	t.Parallel()
+
+	got := briefCachePath(filepath.Join("dir", "movie.el.srt"))
+	want := filepath.Join("dir", ".movie.el.srt.brief")
+	if got != want {
+		t.Errorf("briefCachePath = %q, want %q", got, want)
 	}
 }

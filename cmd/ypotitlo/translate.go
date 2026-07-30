@@ -155,6 +155,10 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	if err != nil {
 		return &parseError{err}
 	}
+	// Kept so that a partial run can say how much of the *file* is left, rather
+	// than how much of this attempt was. The Cue structs are copied; their line
+	// slices are never mutated in place, only replaced.
+	sourceCues := slices.Clone(file.Cues)
 	for _, w := range file.Warnings {
 		warnf(e, "%s", w)
 	}
@@ -273,8 +277,14 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	if plan != nil {
 		todo = plan.missing
 		opts.BriefCues = file.Cues
+		if cached := loadBrief(outPath, target.Code, sourceCues); cached != nil {
+			opts.PreparedBrief = cached
+		}
 		ui.Suspend(func() {
 			outf(e.Stderr, "resuming: %d of %d cues still to translate\n", len(todo), len(file.Cues))
+			if opts.PreparedBrief != nil {
+				outf(e.Stderr, "reusing the brief from the previous run\n")
+			}
 		})
 	}
 
@@ -295,8 +305,12 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 			if werr := writeOutput(e, file, f, outPath); werr != nil {
 				warnf(e, "could not save the partial translation: %v", werr)
 			} else {
-				outf(e.Stderr, "saved %s with %d of %d cues translated\n",
-					displayPath(outPath), n, len(res.Cues))
+				// Park the brief next to the partial file so the resume does not
+				// pay for pass 0 a second time.
+				if berr := saveBrief(outPath, target.Code, sourceCues, briefOf(res, opts)); berr != nil {
+					warnf(e, "could not cache the brief for a resume: %v", berr)
+				}
+				reportPartial(e, f, outPath, sourceCues, file.Cues)
 			}
 		}
 		return classifyRunError(err, keySource)
@@ -309,6 +323,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	if err := writeOutput(e, file, f, outPath); err != nil {
 		return err
 	}
+	dropBrief(outPath)
 
 	writeFooter(e, res.Stats, outPath, f, elapsed)
 	return nil
@@ -711,6 +726,80 @@ func applyResult(file *srt.File, plan *resumePlan, out []srt.Cue) []srt.Cue {
 	}
 	plan.merge(out)
 	return plan.existing.Cues
+}
+
+// briefOf is the brief a run used, whether it computed one or was given one.
+func briefOf(res translate.Result, opts translate.Options) *translate.Brief {
+	if res.Brief != nil {
+		return res.Brief
+	}
+	return opts.PreparedBrief
+}
+
+// reportPartial says what survived a failed run and how to finish it.
+//
+// The counts are against the whole file rather than against this attempt: after
+// a resume, "2 of 21 translated" describes the attempt and tells the reader
+// nothing about the subtitle they are holding. And the run has just failed after
+// spending real time and money, so the next step should not have to be worked
+// out from the manual.
+func reportPartial(e env, f translateFlags, outPath string, before, after []srt.Cue) {
+	remaining := untranslatedCount(before, after)
+	done := len(after) - remaining
+
+	outf(e.Stderr, "saved %s: %d of %d cues translated, %d still to go\n",
+		displayPath(outPath), done, len(after), remaining)
+	if remaining > 0 {
+		outf(e.Stderr, "finish it with:\n  %s\n", resumeCommand(f))
+	}
+}
+
+// untranslatedCount is how many cues still carry their source text.
+func untranslatedCount(before, after []srt.Cue) int {
+	if len(after) != len(before) {
+		return 0
+	}
+	n := 0
+	for i := range after {
+		if slices.Equal(after[i].Lines, before[i].Lines) {
+			n++
+		}
+	}
+	return n
+}
+
+// resumeCommand rebuilds the invocation that continues this run, carrying over
+// the options that would otherwise be lost.
+func resumeCommand(f translateFlags) string {
+	parts := []string{"ypotitlo", "translate", "-i", shellQuote(f.in)}
+	if f.targetLangSet {
+		parts = append(parts, "-ol", shellQuote(f.targetLang))
+	}
+	if f.out != "" {
+		parts = append(parts, "-o", shellQuote(f.out))
+	}
+	if f.charsetName != "" {
+		parts = append(parts, "-charset", shellQuote(f.charsetName))
+	}
+	if f.modelGiven {
+		parts = append(parts, "-m", shellQuote(f.model))
+	}
+	if f.baseURLGiven {
+		parts = append(parts, "-base-url", shellQuote(f.baseURL))
+	}
+	if f.configPath != "" {
+		parts = append(parts, "-config", shellQuote(f.configPath))
+	}
+	return strings.Join(append(parts, "-resume"), " ")
+}
+
+// shellQuote makes a path safe to paste back into a shell. Subtitle paths are
+// full of spaces, brackets and apostrophes.
+func shellQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n\"'$`\\()[]{}*?!&;|<>#~") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // translatedCount is how many cues actually changed, which is the only

@@ -113,6 +113,16 @@ with the same timings as its input, so a cue whose text still matches the source
 is one that never got translated. The whole file is still read for the
 consistency brief, so the cues filled in match the ones already there.
 
+A failed run prints the exact command to finish it, so the next step is a paste
+rather than a trip to the manual.
+
+It also parks the consistency brief in a hidden file beside the output
+(`.movie.el.srt.brief`) and picks it up on the resume, since the brief describes
+the film rather than the attempt and costs about a minute to compute. That file
+is written only when a run fails with work worth keeping, and removed as soon as
+one finishes, so it exists exactly while it is useful. It is ignored if it was
+written for a different subtitle or a different target language.
+
 One imprecision that does not go away: a line that legitimately translates to
 itself — a number, a name, `♪` — looks untranslated and is re-sent every time.
 That costs a little and changes nothing, but a resume never reports zero

@@ -130,6 +130,19 @@ func writeSources(w io.Writer, sources []config.Source) {
 			if sh.Value == "" {
 				continue
 			}
+			// Nor is a value shadowed by its own source worth reporting: the
+			// api_key row is rebuilt from the resolver, which re-states the file
+			// as the winner, and "set in config, shadowed by config" tells the
+			// reader nothing.
+			if sh.From == s.From {
+				continue
+			}
+			// Beating the built-in default is what a config file is for. Only a
+			// clash between two places the user actually wrote something is
+			// worth pointing at.
+			if sh.From == config.FromDefault {
+				continue
+			}
 			notes = append(notes, fmt.Sprintf("%s is also set in %s, shadowed by %s", s.Key, sh.From, s.From))
 		}
 	}

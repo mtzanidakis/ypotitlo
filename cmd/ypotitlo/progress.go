@@ -22,6 +22,10 @@ const (
 	markWarn = "!"
 )
 
+// etaMinPercent is how much of the work must be finished before an estimate is
+// shown at all.
+const etaMinPercent = 5
+
 // progressUI draws a single self-updating status line: what the run is doing
 // now, how long it has been going, and — once there is enough evidence to say —
 // how much longer it will take.
@@ -155,11 +159,13 @@ func (p *progressUI) Progress(done, total int) {
 
 // recalcETA re-estimates from the rate so far. Caller holds the lock.
 //
-// It stays hidden until a tenth of the work is done, because an estimate drawn
-// from two cues out of seven hundred is noise presented as information.
+// It stays hidden until a small share of the work is done, because an estimate
+// drawn from two cues out of seven hundred is noise presented as information.
+// The threshold is a trade: lower shows a number sooner and lets it wobble more
+// while the sample is thin.
 func (p *progressUI) recalcETA() {
 	p.haveETA = false
-	if p.total <= 0 || p.done <= 0 || p.done*10 < p.total || p.done >= p.total {
+	if p.total <= 0 || p.done <= 0 || p.done*100 < p.total*etaMinPercent || p.done >= p.total {
 		return
 	}
 	spent := p.now().Sub(p.phaseAt)

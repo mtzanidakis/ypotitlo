@@ -76,7 +76,7 @@ func TestETACountsDownBetweenUpdates(t *testing.T) {
 
 	advance(10 * time.Second)
 	buf.Reset()
-	p.Progress(2, 700) // under a tenth: no estimate yet
+	p.Progress(2, 700) // under the threshold: no estimate yet
 	if strings.Contains(buf.String(), "eta") {
 		t.Errorf("an ETA was shown from 2/700: %q", buf.String())
 	}
@@ -280,4 +280,27 @@ func (p *progressUI) etaFor(t *testing.T) (time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.eta()
+}
+
+// The estimate appears at the configured share of the work and not before.
+func TestETAThresholdBoundary(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(0, 0).UTC()
+	p := newProgressUI(&bytes.Buffer{}, true, func() time.Time { return now })
+	p.Phase("translating")
+	now = now.Add(time.Minute)
+
+	const total = 1000
+	under := total*etaMinPercent/100 - 1
+	p.Progress(under, total)
+	if _, ok := p.etaFor(t); ok {
+		t.Errorf("an ETA was shown at %d/%d, below the %d%% threshold", under, total, etaMinPercent)
+	}
+
+	at := total * etaMinPercent / 100
+	p.Progress(at, total)
+	if _, ok := p.etaFor(t); !ok {
+		t.Errorf("no ETA at %d/%d, the %d%% threshold", at, total, etaMinPercent)
+	}
 }

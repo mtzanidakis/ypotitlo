@@ -364,3 +364,30 @@ func TestTagList(t *testing.T) {
 		t.Errorf("tagList = %q", got)
 	}
 }
+
+func TestRestoreSpeakerDash(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		src, translated string
+		want            string
+	}{
+		{"dropped dash is restored", "- Where are you going?", "Πού πηγαίνεις;", "- Πού πηγαίνεις;"},
+		{"kept dash is left alone", "- Yes.", "- Ναι.", "- Ναι."},
+		{"tight dash keeps its form", "-Yes.", "Ναι.", "-Ναι."},
+		{"no dash in the source", "Hello.", "Γεια.", "Γεια."},
+		{"em-dash substitute is not a marker", "-- pause --", "-- παύση --", "-- παύση --"},
+		{"lone dash is not a marker", "-", "-", "-"},
+		{"leading space in the translation is not doubled", "- Yes.", "  Ναι.", "- Ναι."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := restoreSpeakerDash(tt.src, tt.translated); got != tt.want {
+				t.Errorf("restoreSpeakerDash(%q, %q) = %q, want %q", tt.src, tt.translated, got, tt.want)
+			}
+		})
+	}
+}

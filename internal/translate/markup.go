@@ -125,6 +125,8 @@ func splitLine(s string) lineParts {
 // lose data, and guessing a character offset in a different language would put
 // an override in the middle of a word. prepare warns whenever this happens.
 func (p lineParts) rebuild(core string) string {
+	core = restoreSpeakerDash(p.core, core)
+
 	var b strings.Builder
 	b.WriteString(p.leadWS)
 	for _, t := range p.lead {
@@ -139,6 +141,45 @@ func (p lineParts) rebuild(core string) string {
 	}
 	b.WriteString(p.trailWS)
 	return b.String()
+}
+
+// restoreSpeakerDash re-attaches a leading dash the model dropped.
+//
+// A dash at the start of a subtitle line marks a change of speaker within one
+// cue. It is structure, not words, and losing it merges two people's dialogue
+// into one voice for a viewer. Observed once in a 656-cue film: the model
+// translated both lines of a two-speaker cue correctly and returned only the
+// first dash.
+//
+// Restoring it is safe precisely because it is not content — the prompt asks
+// for the dash to be kept, this only repairs the cases where that was ignored,
+// and a line that already has one is left alone.
+func restoreSpeakerDash(src, translated string) string {
+	dash, ok := leadingDash(src)
+	if !ok {
+		return translated
+	}
+	if _, already := leadingDash(translated); already {
+		return translated
+	}
+	return dash + strings.TrimLeft(translated, " \t")
+}
+
+// leadingDash returns the speaker-dash prefix of s ("- " or "-"), if any.
+func leadingDash(s string) (string, bool) {
+	t := strings.TrimLeft(s, " \t")
+	if !strings.HasPrefix(t, "-") {
+		return "", false
+	}
+	// A lone "-" or "--" is punctuation or an em-dash substitute, not a marker.
+	rest := t[1:]
+	if strings.HasPrefix(rest, "-") || strings.TrimSpace(rest) == "" {
+		return "", false
+	}
+	if strings.HasPrefix(rest, " ") {
+		return "- ", true
+	}
+	return "-", true
 }
 
 // tagMultiset counts markup tags in s, keyed by lowercased name with a leading

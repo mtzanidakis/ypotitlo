@@ -55,6 +55,7 @@ jobs:
       - run: gofmt -l $(go list -f '{{.Dir}}' ./...) | tee gofmt.out && test ! -s gofmt.out
       - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
       # Guards the testability seams: no package may read the real home dir.
+      # The task preserves GOCACHE/GOMODCACHE, which otherwise live under $HOME.
       - run: mise run test-nohome
       - uses: actions/upload-artifact@v7
         with:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,15 +44,22 @@ func environ() env {
 	}
 }
 
+// outf writes to a CLI output stream. Write errors on stdout/stderr are not
+// actionable — there is nowhere left to report them — so they are dropped
+// here once rather than ignored at each of the dozens of call sites.
+func outf(w io.Writer, format string, a ...any) {
+	_, _ = fmt.Fprintf(w, format, a...)
+}
+
 // usageError marks an error as a misuse of the command line rather than a
 // runtime failure, so run can map it to exitUsage.
 type usageError struct{ err error }
 
-func (e usageError) Error() string { return e.err.Error() }
-func (e usageError) Unwrap() error { return e.err }
+func (e *usageError) Error() string { return e.err.Error() }
+func (e *usageError) Unwrap() error { return e.err }
 
 func usagef(format string, a ...any) error {
-	return usageError{fmt.Errorf(format, a...)}
+	return &usageError{fmt.Errorf(format, a...)}
 }
 
 type command struct {
@@ -84,42 +92,33 @@ func run(ctx context.Context, e env) int {
 		name = "version"
 	}
 
-	cmds := commands()
-	c, ok := cmds[name]
+	c, ok := commands()[name]
 	if !ok {
-		fmt.Fprintf(e.Stderr, "ypotitlo: unknown command %q\n\n", name)
+		outf(e.Stderr, "ypotitlo: unknown command %q\n\n", name)
 		printUsage(e.Stderr)
 		return exitUsage
 	}
 
-	err := c.run(ctx, e, e.Args[1:])
-	return exitCode(ctx, e, err)
+	return exitCode(ctx, e, c.run(ctx, e, e.Args[1:]))
 }
 
 func exitCode(ctx context.Context, e env, err error) int {
 	if err == nil {
 		return exitOK
 	}
+	// A cancelled context outranks whatever error the cancellation produced.
 	if ctx.Err() != nil {
-		fmt.Fprintln(e.Stderr, "ypotitlo: cancelled; no output written")
+		outf(e.Stderr, "ypotitlo: cancelled; no output written\n")
 		return exitCanceled
 	}
 
-	var ue usageError
-	if ok := asUsageError(err, &ue); ok {
-		fmt.Fprintf(e.Stderr, "ypotitlo: %v\n", err)
+	outf(e.Stderr, "ypotitlo: %v\n", err)
+
+	var ue *usageError
+	if errors.As(err, &ue) {
 		return exitUsage
 	}
-	fmt.Fprintf(e.Stderr, "ypotitlo: %v\n", err)
 	return exitError
-}
-
-func asUsageError(err error, target *usageError) bool {
-	if ue, ok := err.(usageError); ok {
-		*target = ue
-		return true
-	}
-	return false
 }
 
 func printUsage(w io.Writer) {
@@ -129,20 +128,18 @@ func printUsage(w io.Writer) {
 
 	cmds := commands()
 	for _, name := range order {
-		c, ok := cmds[name]
-		if !ok {
-			continue // not implemented yet
+		if c, ok := cmds[name]; ok {
+			fmt.Fprintf(&b, "  %-13s %s\n", name, c.desc)
 		}
-		fmt.Fprintf(&b, "  %-13s %s\n", name, c.desc)
 	}
 	b.WriteString("\nRun 'ypotitlo <command> -h' for the flags of a command.\n")
-	fmt.Fprint(w, b.String())
+	outf(w, "%s", b.String())
 }
 
 func cmdVersion(_ context.Context, e env, args []string) error {
 	if len(args) > 0 {
 		return usagef("version takes no arguments, got %q", args[0])
 	}
-	fmt.Fprintln(e.Stdout, version)
+	outf(e.Stdout, "%s\n", version)
 	return nil
 }

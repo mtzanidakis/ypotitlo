@@ -12,8 +12,12 @@ run = "go test -race -covermode=atomic ./..."
 
 # Proves the packages never touch the real home directory: every config path
 # must come from an injected seam, so the suite passes with no HOME at all.
+#
+# GOCACHE and GOMODCACHE must be carried over explicitly. They default to
+# subdirectories of $HOME, so clearing HOME alone makes the toolchain itself
+# fail ("failed to initialize build cache") before a single test compiles.
 [tasks.test-nohome]
-run = "env HOME=/nonexistent XDG_CONFIG_HOME= XDG_DATA_HOME= go test ./..."
+run = "env HOME=/nonexistent XDG_CONFIG_HOME= XDG_DATA_HOME= GOCACHE=$(go env GOCACHE) GOMODCACHE=$(go env GOMODCACHE) go test ./..."
 
 [tasks.lint]
 run = "golangci-lint run ./..."

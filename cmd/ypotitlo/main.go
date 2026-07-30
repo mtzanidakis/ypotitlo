@@ -18,7 +18,9 @@ var version = "dev"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	os.Exit(run(ctx, environ()))
+	// Not deferred: os.Exit does not run deferred functions, so stop() is
+	// called explicitly before exiting.
+	code := run(ctx, environ())
+	stop()
+	os.Exit(code)
 }

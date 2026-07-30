@@ -340,6 +340,29 @@ func checkWritable(dir string) error {
 	return nil
 }
 
+// createTemp makes a uniquely named file in dir with mode applied at creation.
+//
+// os.CreateTemp is not used because it hardcodes 0600, which would then need a
+// chmod to correct — and chmod is the thing to avoid here. CIFS and NFS derive
+// file modes from mount options and refuse it, so the call either errors or does
+// nothing, and a subtitle directory usually lives on one; warning about that on
+// every run would be pure noise. Setting the mode at creation gets the right
+// result on a local filesystem and is silently governed by the mount elsewhere.
+func createTemp(dir string, mode os.FileMode) (*os.File, string, error) {
+	for range 10 {
+		name := filepath.Join(dir, fmt.Sprintf(".ypotitlo-%d-%d.tmp", os.Getpid(), time.Now().UnixNano()))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, os.ErrExist) {
+			continue // vanishingly unlikely; try another name
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return f, name, nil
+	}
+	return nil, "", fmt.Errorf("could not find an unused temporary name in %s", dir)
+}
+
 // outputMode is the mode for a new output file: the existing file's when
 // replacing one, otherwise 0644 less the process umask.
 func outputMode(outPath string) os.FileMode {
@@ -461,11 +484,10 @@ func writeOutput(e env, file *srt.File, f translateFlags, outPath string) error 
 	}
 
 	dir := filepath.Dir(outPath)
-	tmp, err := os.CreateTemp(dir, ".ypotitlo-*.tmp")
+	tmp, tmpName, err := createTemp(dir, outputMode(outPath))
 	if err != nil {
-		return err
+		return fmt.Errorf("creating a temporary file in %s: %w", dir, err)
 	}
-	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
 
 	if _, err := tmp.Write(body); err != nil {
@@ -482,13 +504,6 @@ func writeOutput(e env, file *srt.File, f translateFlags, outPath string) error 
 	}
 	if err := tmp.Close(); err != nil {
 		return err
-	}
-	// Permission bits are cosmetic next to the content. CIFS and NFS mounts
-	// routinely refuse chmod, and the output here is usually on one — losing a
-	// translation that has already been paid for because its mode could not be
-	// adjusted is the wrong trade.
-	if err := os.Chmod(tmpName, outputMode(outPath)); err != nil {
-		warnf(e, "could not set permissions on the output: %v", err)
 	}
 	return os.Rename(tmpName, outPath)
 }

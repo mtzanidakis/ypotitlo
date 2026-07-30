@@ -441,3 +441,69 @@ func TestUnwritableOutputDirIsCaughtEarly(t *testing.T) {
 		t.Errorf("error = %q, want it to say the directory is unwritable", err)
 	}
 }
+
+// The output file must not inherit os.CreateTemp's 0600. A subtitle read by a
+// media server running as another user has to be readable by it, and there is no
+// chmod to correct the mode afterwards — CIFS and NFS refuse chmod, so the mode
+// is applied at creation instead.
+func TestOutputModeIsNotPrivate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "movie.el.srt")
+
+	f, name, err := createTemp(dir, outputMode(out))
+	if err != nil {
+		t.Fatalf("createTemp: %v", err)
+	}
+	defer func() { _ = os.Remove(name) }()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o004 == 0 && umask()&0o004 == 0 {
+		t.Errorf("mode = %o; the output must be readable by others unless the umask says otherwise", perm)
+	}
+	if perm == 0o600 {
+		t.Errorf("mode = 600; the temporary file's private mode leaked to the output")
+	}
+}
+
+// Replacing a file keeps its mode, so a deliberately restricted subtitle stays
+// restricted after a re-translation.
+func TestOutputModeFollowsAnExistingFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "movie.el.srt")
+	if err := os.WriteFile(out, []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if got := outputMode(out); got != 0o640 {
+		t.Errorf("outputMode = %o, want 640 (the existing file's)", got)
+	}
+}
+
+// Two temporary files in the same directory must not collide.
+func TestCreateTempIsUnique(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	seen := map[string]bool{}
+	for range 5 {
+		f, name, err := createTemp(dir, 0o644)
+		if err != nil {
+			t.Fatalf("createTemp: %v", err)
+		}
+		_ = f.Close()
+		if seen[name] {
+			t.Fatalf("createTemp returned %q twice", name)
+		}
+		seen[name] = true
+	}
+}

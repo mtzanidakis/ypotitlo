@@ -24,11 +24,13 @@ go install github.com/mtzanidakis/ypotitlo/cmd/ypotitlo@latest
 # the endpoint is reachable.
 ypotitlo list-models
 
-# Pick a model.
-ypotitlo config-set model deepseek-v4-pro
+# Pick a model. deepseek-v4-flash translates a feature film for pennies;
+# the reasoning models cost roughly ten times as much for the same file.
+ypotitlo config-set model deepseek-v4-flash
 
 # Provide a key, read from stdin so it stays out of your shell history.
-# Skipped entirely if you already use opencode: its credentials are reused.
+# The same key works for both OpenCode Go and Zen, and is skipped entirely
+# if you already use the opencode CLI: its credentials are reused.
 ypotitlo config-set api_key -
 
 # Check the plan before spending anything.
@@ -96,17 +98,55 @@ Whatever is not translated comes back untouched — leading whitespace, inline
 whole design constraint, and it is why this tool has its own SRT parser rather
 than using an existing library.
 
+## OpenCode Go and OpenCode Zen
+
+These are two products behind one account, and **the same API key works for
+both**. Which one you use is decided entirely by `base_url`:
+
+| | `base_url` | Billing | Models |
+| --- | --- | --- | --- |
+| **OpenCode Go** (default) | `https://opencode.ai/zen/go/v1` | Monthly subscription | 23, open-weight |
+| **OpenCode Zen** | `https://opencode.ai/zen/v1` | Pay as you go | 60+, adds Claude, GPT and Gemini |
+
+`ypotitlo` defaults to Go, since a subscription is the sensible way to pay for
+something that runs in batches. Switch per run or for good:
+
+```sh
+ypotitlo translate -i movie.en.srt -ol el -base-url https://opencode.ai/zen/v1 -m claude-sonnet-5
+ypotitlo config-set base_url https://opencode.ai/zen/v1
+```
+
+If you already use the `opencode` CLI, its key is picked up automatically and
+there is nothing to configure.
+
 ## Cost
 
 `translate` prints a summary of every run:
 
 ```
-34 calls · 71204 in / 24880 out tokens · ~$0.2107 · 2 retries · 0 cues untranslated
+34 calls · 73778 in / 388006 out tokens · ~$0.1190 · 0 retries · 0 cues untranslated
 ```
 
-`max_spend_usd` caps a run and defaults to $1. A model with no published price
-cannot be costed, so the cap cannot be enforced for it; `list-models` says which
-those are, and the summary says so too.
+**On a Go subscription that dollar figure is not your bill.** It is computed
+from the published pay-as-you-go list prices, because that is the only pricing
+the API exposes; the subscription's marginal cost is zero until you hit its
+limits. Read it as a measure of how much work a run did — useful for comparing
+models and batch sizes — rather than as money leaving your account. On Zen it is
+a genuine estimate.
+
+`max_spend_usd` caps a run and defaults to $1. It stops the run *before* the
+request that would cross it. Note the same caveat: on a subscription it is a
+usage ceiling rather than a spending one.
+
+Two things it cannot do. A model with no published price cannot be costed at
+all, so the cap never engages for it — `list-models` marks those, and the run
+summary says so. And thinking is charged as output: on a reasoning model the
+same subtitle file can cost ten times what it does on a plain one, which is why
+the summary reports output tokens separately.
+
+The other ceilings are a call fuse (`3 × batches + 10`) and `-timeout`, which
+default to 109 calls and 30 minutes for a typical film. Those still apply to
+unpriced models.
 
 ## Configuration
 
@@ -132,9 +172,8 @@ note: api_key is also set in config, shadowed by env OPENCODE_API_KEY
 The API key is looked for in `-api-key`, then `$OPENCODE_API_KEY`, then
 `$OPENCODE_ZEN_API_KEY`, then the config file, and finally in opencode's own
 `auth.json` — so an existing opencode install needs no configuration at all.
-
-`base_url` is worth knowing about: the default pool carries only open-weight
-models. Claude, GPT and Gemini live under `https://opencode.ai/zen/v1`.
+One key serves both endpoints; see [OpenCode Go and OpenCode
+Zen](#opencode-go-and-opencode-zen) for what `base_url` selects.
 
 ## Exit codes
 

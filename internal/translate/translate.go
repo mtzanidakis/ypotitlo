@@ -204,12 +204,27 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 		return Result{}, errors.New("translate: no model configured")
 	}
 
-	r.lastProgress = r.clock()
 	r.out = make([][]string, len(cues))
 	r.total = len(cues)
 	r.budget(len(cues))
 
+	// The watchdog covers the whole run, not just the batch phase. Pass 0 is a
+	// provider call like any other and can hang like any other: an earlier
+	// version armed the watchdog inside work(), and a brief that took twelve
+	// minutes to fail went entirely unwatched.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.cancel = cancel
+	r.lastProgress = r.clock()
+	stop := r.watchdog(ctx)
+	defer stop()
+
 	brief := r.makeBrief(ctx, cues)
+	if err := r.aborted(); err != nil {
+		return Result{Stats: r.snapshot(), Warnings: r.warningList()}, err
+	}
+	// Pass 0 finishing is progress, even when it failed: the call came back.
+	r.markProgress()
 	r.sys = systemPrompt(o.Source, o.Target, brief)
 
 	ranges := planBatches(cues, r.o.BatchSize)
@@ -267,8 +282,32 @@ type runner struct {
 	consecutiveFailures int
 	lastFailure         error
 
-	// lastProgress is when a batch last completed; see watchdog.
+	// lastProgress is when the run last advanced; see watchdog.
 	lastProgress time.Time
+
+	// abort state, shared by the watchdog and the workers so that whichever
+	// notices trouble first stops the whole run.
+	cancel    context.CancelFunc
+	abortOnce sync.Once
+	abortErr  error
+}
+
+// abort records the first fatal condition and cancels the run.
+func (r *runner) abort(err error) {
+	r.abortOnce.Do(func() {
+		r.mu.Lock()
+		r.abortErr = err
+		r.mu.Unlock()
+		if r.cancel != nil {
+			r.cancel()
+		}
+	})
+}
+
+func (r *runner) aborted() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.abortErr
 }
 
 // nextSeed draws the sampling seed for one call.
@@ -430,7 +469,7 @@ func (g guarded) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 // a failure, so a counter of failures stays at zero forever while the run sits
 // there. Any completed batch resets the clock, so a slow model is not mistaken
 // for a stuck one.
-func (r *runner) watchdog(ctx context.Context, fail func(error)) (stop func()) {
+func (r *runner) watchdog(ctx context.Context) (stop func()) {
 	limit := r.o.StallTimeout
 	if limit <= 0 {
 		limit = defaultStallTimeout
@@ -454,7 +493,7 @@ func (r *runner) watchdog(ctx context.Context, fail func(error)) (stop func()) {
 				return
 			case <-tick.C:
 				if idle := r.idleFor(); idle >= limit {
-					fail(fmt.Errorf("%w: nothing completed for %s", ErrStalled, idle.Round(time.Second)))
+					r.abort(fmt.Errorf("%w: nothing advanced for %s", ErrStalled, idle.Round(time.Second)))
 					return
 				}
 			}
@@ -485,25 +524,6 @@ func (r *runner) clock() time.Time {
 }
 
 func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var (
-		once  sync.Once
-		fatal error
-	)
-	fail := func(err error) {
-		once.Do(func() { fatal = err; cancel() })
-	}
-
-	// Watchdog. The circuit breaker counts failures, so it is blind to a call
-	// that never returns at all — and that is a real failure mode, not a
-	// theoretical one: an HTTP connection can sit ESTABLISHED and silent while
-	// the service itself is healthy. Progress, unlike error counts, is
-	// observable in every such case.
-	stop := r.watchdog(ctx, fail)
-	defer stop()
-
 	jobs := make(chan int)
 	workers := min(r.o.Concurrency, len(ranges))
 
@@ -514,7 +534,7 @@ func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) 
 			defer wg.Done()
 			for i := range jobs {
 				if err := r.runBatch(ctx, cues, ranges[i], i+1); err != nil {
-					fail(err)
+					r.abort(err)
 					return
 				}
 				r.markProgress()
@@ -535,8 +555,8 @@ func (r *runner) work(ctx context.Context, cues []srt.Cue, ranges []batchRange) 
 	close(jobs)
 	wg.Wait()
 
-	if fatal != nil {
-		return fatal
+	if err := r.aborted(); err != nil {
+		return err
 	}
 	// A cancellation that no worker reported still has to be an error: the
 	// caller must never mistake a half-translated file for a finished one.

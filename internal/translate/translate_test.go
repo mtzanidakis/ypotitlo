@@ -1128,3 +1128,57 @@ func TestSlowProgressDoesNotTripTheWatchdog(t *testing.T) {
 	}
 	assertShape(t, in, res.Cues)
 }
+
+// TestWatchdogCoversTheBriefPhase pins a gap found in a real run: the watchdog
+// was armed inside the batch loop, so a pass-0 call that hung went unwatched.
+// The observed run reported "nothing completed for 11m54s" against a six-minute
+// limit, because the clock had been running through the brief the whole time.
+func TestWatchdogCoversTheBriefPhase(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	var briefCalls atomic.Int32
+	p := &fakeProvider{fnCtx: func(ctx context.Context, req llm.Request, _ int) (llm.Response, error) {
+		if req.Stage == "brief" {
+			briefCalls.Add(1)
+			<-ctx.Done() // the brief hangs, exactly as observed
+			return llm.Response{}, ctx.Err()
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = true // the point of the test
+	o.Now = clock
+	o.StallTimeout = time.Minute
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), makeCues(40), o)
+		done <- err
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrStalled) {
+				t.Fatalf("Run error = %v, want ErrStalled", err)
+			}
+			if briefCalls.Load() == 0 {
+				t.Error("the brief was never attempted; the test proves nothing")
+			}
+			return
+		case <-deadline:
+			t.Fatal("a hanging brief was not caught: the watchdog does not cover pass 0")
+		default:
+			advance(30 * time.Second)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+}

@@ -1,0 +1,220 @@
+package lang
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestDeriveOutputPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		in     string
+		target string
+		want   string
+	}{
+		// The ordinary case: replace the language segment.
+		{"two letter code", "movie.en.srt", "el", "movie.el.srt"},
+		{"three letter code", "movie.eng.srt", "el", "movie.el.srt"},
+		{"bibliographic code", "movie.ger.srt", "el", "movie.el.srt"},
+		{"uppercase code", "movie.EN.srt", "el", "movie.el.srt"},
+		{"target given as name", "movie.en.srt", "greek", "movie.el.srt"},
+		{"target given as 639-2", "movie.en.srt", "gre", "movie.el.srt"},
+
+		// P0 #1: markers are peeled before any language test and put back
+		// afterwards. Without this, movie.sdh.srt becomes movie.el.srt and
+		// overwrites the translation of movie.srt, because "sdh" parses as
+		// Southern Kurdish.
+		{"sdh only", "movie.sdh.srt", "el", "movie.el.sdh.srt"},
+		{"lang plus sdh", "movie.eng.sdh.srt", "el", "movie.el.sdh.srt"},
+		{"lang plus forced", "movie.en.forced.srt", "el", "movie.el.forced.srt"},
+		{"lang plus cc", "movie.en.cc.srt", "el", "movie.el.cc.srt"},
+		{"hi marker not hindi", "movie.hi.srt", "el", "movie.el.hi.srt"},
+		{"two markers keep order", "movie.en.forced.sdh.srt", "el", "movie.el.forced.sdh.srt"},
+		{"marker case insensitive", "movie.en.SDH.srt", "el", "movie.el.SDH.srt"},
+		{"marker only, no lang", "movie.forced.srt", "el", "movie.el.forced.srt"},
+		{"hearing impaired", "movie.en.hearing.impaired.srt", "el", "movie.el.hearing.impaired.srt"},
+
+		// P0 #3: sub/srt/ass/ssa are well-formed but unassigned subtags, so
+		// language.Parse accepts them. The names lookup is what rejects them.
+		{"sub segment", "movie.sub.srt", "el", "movie.el.sub.srt"},
+		{"ass segment", "movie.ass.srt", "el", "movie.el.ass.srt"},
+
+		// Nothing to replace: append.
+		{"year", "movie.2024.srt", "el", "movie.2024.el.srt"},
+		{"episode code", "s01e01.srt", "el", "s01e01.el.srt"},
+		{"plain name", "movie.srt", "el", "movie.el.srt"},
+		{"release name", "Sirat.2025.1080p.WEBRip.srt", "el", "Sirat.2025.1080p.WEBRip.el.srt"},
+
+		// No extension at all.
+		{"no extension", "movie", "el", "movie.el.srt"},
+		{"no extension with dot dir", "/a.b/movie", "el", "/a.b/movie.el.srt"},
+		{"unknown extension", "movie.2024", "el", "movie.2024.el.srt"},
+
+		// Extension handling.
+		{"uppercase extension", "movie.en.SRT", "el", "movie.el.SRT"},
+		{"mixed case extension", "movie.en.Srt", "el", "movie.el.Srt"},
+		{"vtt", "movie.en.vtt", "el", "movie.el.vtt"},
+		{"ass extension", "movie.en.ass", "el", "movie.el.ass"},
+		{"sub extension", "movie.en.sub", "el", "movie.el.sub"},
+
+		// Directories are carried through verbatim, including "./".
+		{"relative dot", "./movie.en.srt", "el", "./movie.el.srt"},
+		{"absolute", "/subs/movie.en.srt", "el", "/subs/movie.el.srt"},
+		{"nested", "a/b/movie.en.srt", "el", "a/b/movie.el.srt"},
+		{"dot in directory", "/a.b/movie.en.srt", "el", "/a.b/movie.el.srt"},
+
+		// The single-segment stem must survive: en.srt is a file called
+		// "en", not a language with nothing in front of it.
+		{"stem is only a language", "en.srt", "el", "en.el.srt"},
+		{"stem is only a marker", "sdh.srt", "el", "sdh.el.srt"},
+
+		// Script and region targets.
+		{"traditional chinese target", "movie.en.srt", "zh-Hant", "movie.zh-Hant.srt"},
+		{"brazilian target", "movie.en.srt", "pt-BR", "movie.pt-BR.srt"},
+
+		// Idempotence: already-translated input derives to itself. The
+		// caller detects that with SameFile and refuses to overwrite.
+		{"already target", "movie.el.srt", "el", "movie.el.srt"},
+		{"already target long code", "movie.ell.srt", "el", "movie.el.srt"},
+
+		// A bare zh segment is still a language segment, so it gets
+		// replaced even though we refuse zh as a target.
+		{"zh segment replaced", "movie.zh.srt", "el", "movie.el.srt"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Paths are written with "/" and translated to the host
+			// separator, since DeriveOutputPath preserves the directory
+			// prefix verbatim.
+			in, want := native(tc.in), native(tc.want)
+
+			target, err := Resolve(tc.target)
+			if err != nil {
+				t.Fatalf("Resolve(%q): %v", tc.target, err)
+			}
+			got, err := DeriveOutputPath(in, target)
+			if err != nil {
+				t.Fatalf("DeriveOutputPath(%q, %s): %v", in, tc.target, err)
+			}
+			if got != want {
+				t.Errorf("DeriveOutputPath(%q, %s) = %q, want %q", in, tc.target, got, want)
+			}
+		})
+	}
+}
+
+func TestDeriveOutputPathIdempotent(t *testing.T) {
+	t.Parallel()
+
+	// Running the derivation on its own output must be a fixed point;
+	// otherwise a second run of the tool writes to a third filename and the
+	// SameFile guard never fires.
+	el, err := Resolve("greek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{
+		"movie.en.srt", "movie.eng.sdh.srt", "movie.2024.srt", "s01e01.srt",
+		"movie", "movie.en.forced.srt", "/a.b/movie.fre.srt",
+	} {
+		once, err := DeriveOutputPath(in, el)
+		if err != nil {
+			t.Fatalf("DeriveOutputPath(%q): %v", in, err)
+		}
+		twice, err := DeriveOutputPath(once, el)
+		if err != nil {
+			t.Fatalf("DeriveOutputPath(%q): %v", once, err)
+		}
+		if once != twice {
+			t.Errorf("DeriveOutputPath not idempotent for %q: %q then %q", in, once, twice)
+		}
+	}
+}
+
+func TestDeriveOutputPathErrors(t *testing.T) {
+	t.Parallel()
+
+	el, err := Resolve("el")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		in     string
+		target Lang
+		want   string
+	}{
+		{"empty stem", ".srt", el, "no filename"},
+		{"empty stem with dir", "/subs/.srt", el, "no filename"},
+		{"empty path", "", el, "empty input path"},
+		{"stdin", "-", el, "stdin"},
+		{"trailing separator", "subs" + string(filepath.Separator), el, "directory"},
+		{"zero target", "movie.en.srt", Lang{}, "no target language"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := DeriveOutputPath(tc.in, tc.target)
+			if err == nil {
+				t.Fatalf("DeriveOutputPath(%q) = %q, want error", tc.in, got)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("DeriveOutputPath(%q) error = %q, want it to mention %q", tc.in, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestExtIsDirectoryAware pins down the assumption that lets DeriveOutputPath
+// skip any special handling for dots in parent directories.
+func TestExtIsDirectoryAware(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ in, want string }{
+		{"/a.b/movie", ""},
+		{"a.b/movie", ""},
+		{"/a.b/movie.srt", ".srt"},
+		{"movie", ""},
+		{".srt", ".srt"},
+		{"movie.2024.srt", ".srt"},
+	} {
+		if got := filepath.Ext(tc.in); got != tc.want {
+			t.Errorf("filepath.Ext(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestResolvesAsLanguage(t *testing.T) {
+	t.Parallel()
+
+	yes := []string{"en", "eng", "el", "ell", "gre", "de", "ger", "fr", "fre", "pt", "nb", "sr", "zh", "EN"}
+	no := []string{
+		"sdh", "hi", "cc", "sub", "subs", "srt", "ass", "ssa", "vtt", "forced", "hoh", "dub",
+		"2024", "s01e01", "1080p", "x", "", "movie", "qqq", "web",
+	}
+
+	for _, s := range yes {
+		if !resolvesAsLanguage(s) {
+			t.Errorf("resolvesAsLanguage(%q) = false, want true", s)
+		}
+	}
+	for _, s := range no {
+		if resolvesAsLanguage(s) {
+			t.Errorf("resolvesAsLanguage(%q) = true, want false", s)
+		}
+	}
+}
+
+// native rewrites a slash-separated test path to the host separator.
+func native(p string) string {
+	return strings.ReplaceAll(p, "/", string(filepath.Separator))
+}

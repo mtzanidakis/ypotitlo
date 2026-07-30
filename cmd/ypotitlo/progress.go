@@ -47,6 +47,12 @@ type progressUI struct {
 	warned   bool      // something was warned about during this phase
 	stopped  bool
 
+	// The estimate is computed when progress arrives and counted down between
+	// updates; see eta.
+	etaAt    time.Time
+	etaValue time.Duration
+	haveETA  bool
+
 	stop chan struct{}
 	wg   sync.WaitGroup
 	now  func() time.Time
@@ -102,6 +108,7 @@ func (p *progressUI) Phase(name string) {
 	p.phaseAt = p.now()
 	p.done, p.total = 0, 0
 	p.warned = false
+	p.haveETA = false
 	p.draw()
 }
 
@@ -142,7 +149,27 @@ func (p *progressUI) Progress(done, total int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.done, p.total = done, total
+	p.recalcETA()
 	p.draw()
+}
+
+// recalcETA re-estimates from the rate so far. Caller holds the lock.
+//
+// It stays hidden until a tenth of the work is done, because an estimate drawn
+// from two cues out of seven hundred is noise presented as information.
+func (p *progressUI) recalcETA() {
+	p.haveETA = false
+	if p.total <= 0 || p.done <= 0 || p.done*10 < p.total || p.done >= p.total {
+		return
+	}
+	spent := p.now().Sub(p.phaseAt)
+	if spent <= 0 {
+		return
+	}
+	perUnit := spent / time.Duration(p.done)
+	p.etaValue = perUnit * time.Duration(p.total-p.done)
+	p.etaAt = p.now()
+	p.haveETA = true
 }
 
 // Suspend clears the status line, runs f, and lets the next tick redraw. Any
@@ -233,22 +260,23 @@ func (p *progressUI) draw() {
 	p.lastLine = runeLen(line)
 }
 
-// eta extrapolates from the current phase's rate. It stays hidden until a tenth
-// of the work is done, because an estimate from two cues out of seven hundred is
-// noise presented as information.
+// eta counts the last estimate down rather than recomputing it every frame.
+//
+// Recomputing it was wrong in a way that showed: progress arrives in batches, so
+// between two of them the elapsed time grows while the completed count does not,
+// and an estimate of elapsed÷done×remaining therefore climbs by a second every
+// second and then drops back when the next batch lands. Counting down means the
+// number only moves upward when new information genuinely says the run is slower
+// than it looked.
 func (p *progressUI) eta() (time.Duration, bool) {
-	if p.total <= 0 || p.done <= 0 || p.done*10 < p.total {
+	if !p.haveETA || p.done >= p.total {
 		return 0, false
 	}
-	if p.done >= p.total {
-		return 0, false
+	left := p.etaValue - p.now().Sub(p.etaAt)
+	if left < 0 {
+		left = 0
 	}
-	spent := p.now().Sub(p.phaseAt)
-	if spent <= 0 {
-		return 0, false
-	}
-	perCue := spent / time.Duration(p.done)
-	return perCue * time.Duration(p.total-p.done), true
+	return left, true
 }
 
 func (p *progressUI) erase() {

@@ -55,9 +55,56 @@ func TestProgressUIShowsPhaseAndCounts(t *testing.T) {
 	}
 }
 
-// The ETA appears only once there is enough work behind it. An estimate from two
-// cues out of seven hundred is noise dressed as information.
-func TestProgressUIWithholdsAnEarlyETA(t *testing.T) {
+// The ETA appears only once there is enough work behind it, and then counts
+// down between updates instead of being recomputed from a stale count.
+//
+// Recomputing it every frame was visibly wrong: progress arrives in batches, so
+// between two of them the elapsed time grows while the completed count does not,
+// and elapsed÷done×remaining therefore climbed by a second every second before
+// dropping back when the next batch landed.
+func TestETACountsDownBetweenUpdates(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(0, 0).UTC()
+	clockFn := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	var buf bytes.Buffer
+	p := newProgressUI(&buf, true, clockFn)
+	p.Phase("translating")
+
+	advance(10 * time.Second)
+	buf.Reset()
+	p.Progress(2, 700) // under a tenth: no estimate yet
+	if strings.Contains(buf.String(), "eta") {
+		t.Errorf("an ETA was shown from 2/700: %q", buf.String())
+	}
+
+	// Half done after 10s -> about 10s remaining.
+	buf.Reset()
+	p.Progress(350, 700)
+	first, ok := p.etaFor(t)
+	if !ok {
+		t.Fatalf("no ETA at 350/700: %q", buf.String())
+	}
+
+	// Time passes with no new progress. The estimate must fall, not climb.
+	advance(4 * time.Second)
+	second, ok := p.etaFor(t)
+	if !ok {
+		t.Fatal("the ETA disappeared while waiting")
+	}
+	if second >= first {
+		t.Errorf("ETA went from %v to %v with no progress; it must count down", first, second)
+	}
+	if want := first - 4*time.Second; second != want {
+		t.Errorf("ETA = %v after 4s, want %v", second, want)
+	}
+}
+
+// It never counts below zero, however long a final batch takes.
+func TestETAFloorsAtZero(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
@@ -71,21 +118,18 @@ func TestProgressUIWithholdsAnEarlyETA(t *testing.T) {
 	mu.Lock()
 	now = now.Add(10 * time.Second)
 	mu.Unlock()
+	p.Progress(350, 700)
 
-	buf.Reset()
-	p.Progress(2, 700) // under a tenth
-	if strings.Contains(buf.String(), "eta") {
-		t.Errorf("an ETA was shown from 2/700: %q", buf.String())
-	}
+	mu.Lock()
+	now = now.Add(time.Hour)
+	mu.Unlock()
 
-	buf.Reset()
-	p.Progress(350, 700) // half, after 10s -> ~10s remaining
-	got := buf.String()
-	if !strings.Contains(got, "eta") {
-		t.Fatalf("no ETA at 350/700: %q", got)
+	got, ok := p.etaFor(t)
+	if !ok {
+		t.Fatal("the ETA disappeared")
 	}
-	if !strings.Contains(got, "0:10") {
-		t.Errorf("output = %q, want an ETA near 0:10", got)
+	if got != 0 {
+		t.Errorf("ETA = %v after overrunning, want 0", got)
 	}
 }
 
@@ -228,4 +272,12 @@ func TestStopLeavesNoCompletionMark(t *testing.T) {
 	if strings.Contains(buf.String(), markDone) {
 		t.Errorf("a stopped run must not report a completed phase:\n%q", buf.String())
 	}
+}
+
+// etaFor reads the current estimate under the lock, for tests.
+func (p *progressUI) etaFor(t *testing.T) (time.Duration, bool) {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.eta()
 }

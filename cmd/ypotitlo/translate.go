@@ -52,6 +52,7 @@ type translateFlags struct {
 	timeout       time.Duration
 	dryRun        bool
 	force         bool
+	resume        bool
 	quiet         bool
 	verbose       bool
 	keepIndices   bool
@@ -88,6 +89,7 @@ func cmdTranslate(ctx context.Context, e env, args []string) error {
 	fs.DurationVar(&f.timeout, "timeout", defaultTimeout, "overall deadline")
 	fs.BoolVar(&f.dryRun, "n", false, "report what would happen and make no API calls")
 	fs.BoolVar(&f.force, "f", false, "overwrite an existing output file")
+	fs.BoolVar(&f.resume, "resume", false, "fill in the cues a previous run left untranslated")
 	fs.BoolVar(&f.quiet, "q", false, "suppress progress")
 	fs.BoolVar(&f.verbose, "v", false, "explain what was detected and why")
 	fs.BoolVar(&f.keepIndices, "keep-indices", false, "keep the input's cue numbering")
@@ -162,8 +164,25 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	if err != nil {
 		return err
 	}
-	if err := guardOutput(f, outPath); err != nil {
+	// Resuming reads the previous output and writes it back, so the guard that
+	// refuses an existing file would refuse the whole point of it.
+	guard := f
+	if f.resume {
+		guard.force = true
+	}
+	if err := guardOutput(guard, outPath); err != nil {
 		return err
+	}
+
+	var plan *resumePlan
+	if f.resume {
+		if plan, err = planResume(f.in, outPath, f.charsetName, file); err != nil {
+			return err
+		}
+		if len(plan.missing) == 0 {
+			outf(e.Stderr, "%s is already fully translated\n", displayPath(outPath))
+			return nil
+		}
 	}
 
 	// ---- an empty file is a no-op, not an error and not a call -----------
@@ -248,7 +267,18 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	}
 
 	// ---- translate --------------------------------------------------------
-	res, err := translate.Run(ctx, file.Cues, opts)
+	// A resume translates only the gaps, but pass 0 still reads the whole film:
+	// a brief drawn from twenty scattered lines would describe nothing.
+	todo := file.Cues
+	if plan != nil {
+		todo = plan.missing
+		opts.BriefCues = file.Cues
+		ui.Suspend(func() {
+			outf(e.Stderr, "resuming: %d of %d cues still to translate\n", len(todo), len(file.Cues))
+		})
+	}
+
+	res, err := translate.Run(ctx, todo, opts)
 	if err != nil {
 		failed := ui.Elapsed()
 		ui.Stop()
@@ -260,8 +290,8 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		// away means an hour of work and the money that bought it are lost to
 		// spare the user a file they would rather have had. The error still
 		// stands and the exit code still reports it.
-		if n := translatedCount(file.Cues, res.Cues); n > 0 {
-			file.Cues = res.Cues
+		if n := translatedCount(todo, res.Cues); n > 0 {
+			file.Cues = applyResult(file, plan, res.Cues)
 			if werr := writeOutput(e, file, f, outPath); werr != nil {
 				warnf(e, "could not save the partial translation: %v", werr)
 			} else {
@@ -271,7 +301,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 		}
 		return classifyRunError(err, keySource)
 	}
-	file.Cues = res.Cues
+	file.Cues = applyResult(file, plan, res.Cues)
 
 	elapsed := ui.Elapsed()
 	ui.Complete()
@@ -555,6 +585,9 @@ func reportDryRun(e env, file *srt.File, f translateFlags, cfg config.Config, so
 	}
 
 	outf(e.Stdout, "input          %s (%d cues)\n", displayPath(f.in), len(file.Cues))
+	if f.resume {
+		outf(e.Stdout, "resuming       only the cues still in the source language\n")
+	}
 	outf(e.Stdout, "output         %s\n", displayPath(outPath))
 	outf(e.Stdout, "translating    %s -> %s\n", src, target.English)
 	outf(e.Stdout, "model          %s at %s\n", orNone(cfg.Model), cfg.BaseURL)
@@ -642,6 +675,7 @@ func translateUsage(w io.Writer) {
 				{"-ol LANG", "target language (required unless target_language is configured)"},
 				{"-o FILE", "output file, or - for stdout; omit to derive it from -i"},
 				{"-f", "overwrite an existing output file"},
+				{"-resume", "fill in the cues a previous run left untranslated"},
 				{"-output-charset", "output character set (default utf-8)"},
 				{"-bom / -crlf", "force a BOM or CRLF endings; omit to match the input"},
 				{"-keep-indices", "keep the input's cue numbering instead of renumbering"},
@@ -667,6 +701,16 @@ func translateUsage(w io.Writer) {
 			"ypotitlo translate -i movie.srt -il en -ol el -o out.srt",
 			"ypotitlo translate -i movie.en.srt -ol el -n",
 		})
+}
+
+// applyResult puts a run's cues where they belong: straight through for an
+// ordinary run, or merged back into the previous output when resuming.
+func applyResult(file *srt.File, plan *resumePlan, out []srt.Cue) []srt.Cue {
+	if plan == nil {
+		return out
+	}
+	plan.merge(out)
+	return plan.existing.Cues
 }
 
 // translatedCount is how many cues actually changed, which is the only

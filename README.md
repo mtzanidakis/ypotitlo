@@ -98,6 +98,26 @@ use `-o` for a genuine Hindi track.
 `ypotitlo` refuses to write over its own input, and refuses to overwrite an
 existing file without `-f`.
 
+## Resuming
+
+A run that fails partway still writes what it managed, leaving the rest in the
+source language. `-resume` fills in only those:
+
+```
+ypotitlo translate -i movie.en.srt -resume
+# resuming: 21 of 734 cues still to translate
+```
+
+It needs no state file. The output always has the same cues, in the same order,
+with the same timings as its input, so a cue whose text still matches the source
+is one that never got translated. The whole file is still read for the
+consistency brief, so the cues filled in match the ones already there.
+
+One imprecision that does not go away: a line that legitimately translates to
+itself — a number, a name, `♪` — looks untranslated and is re-sent every time.
+That costs a little and changes nothing, but a resume never reports zero
+remaining.
+
 ## Encodings
 
 Input encoding is detected: BOMs, UTF-16 with or without one, and the legacy

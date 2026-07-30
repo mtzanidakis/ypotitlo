@@ -157,6 +157,13 @@ type Options struct {
 	// text before Run reports failure instead of a result. 0 means 0.5.
 	MaxUntranslatedRatio float64
 
+	// BriefCues is the dialogue pass 0 reads, when it should differ from the
+	// cues being translated. Resuming a partial file translates only the cues
+	// that are still missing, and a brief drawn from those alone would describe
+	// twenty scattered lines rather than the film — so the caller passes the
+	// whole file here while asking for the gaps.
+	BriefCues []srt.Cue
+
 	// Brief enables pass 0 (see brief.go). Note that the zero value is false:
 	// callers that want the brief must ask for it. The command line asks for it
 	// by default.
@@ -263,7 +270,11 @@ func Run(ctx context.Context, cues []srt.Cue, o Options) (Result, error) {
 	// in a phase it did not need.
 	r.phase("brief")
 	briefCtx, cancelBrief := context.WithTimeout(ctx, r.briefDeadline())
-	brief := r.makeBrief(briefCtx, cues)
+	briefCues := cues
+	if len(o.BriefCues) > 0 {
+		briefCues = o.BriefCues
+	}
+	brief := r.makeBrief(briefCtx, briefCues)
 	cancelBrief()
 
 	// Pass 0 finishing is progress, even when it failed: the call came back.

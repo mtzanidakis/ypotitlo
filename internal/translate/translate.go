@@ -891,12 +891,20 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		if skipped > 0 {
 			note = fmt.Sprintf("your previous reply had %d line(s) that were not a JSON object matching the required shape, and no usable ones", skipped)
 		}
-		if err == nil && looksRefusal(resp.Content) {
+		switch {
+		case err != nil:
+			// The call never came back. Reporting that as an unparseable reply
+			// sent the reader looking for a malformed answer that does not
+			// exist — the -v output said `reply began: (empty)`, which is the
+			// symptom of nothing having arrived rather than of bad output.
+			note = "your previous reply did not arrive; send the whole batch again"
+			r.warn("batch %d: retrying after the failed call", job.id)
+		case looksRefusal(resp.Content):
 			note = refusalNudge
 			r.bump(func(s *Stats) { s.Refusals += len(prep) })
 			r.warn("batch %d: model refused the whole batch; retrying once", job.id)
 			r.debug("batch %d: refusal read as: %s", job.id, snippet(resp.Content))
-		} else {
+		default:
 			r.warn("batch %d: unparseable reply; retrying once at temperature 0", job.id)
 			r.debug("batch %d: reply began: %s", job.id, snippet(resp.Content))
 		}

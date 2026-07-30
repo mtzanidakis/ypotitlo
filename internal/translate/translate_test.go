@@ -1368,3 +1368,34 @@ func TestNilHeartbeatIsSafe(t *testing.T) {
 		t.Error("a nil heartbeat should report no beats")
 	}
 }
+
+// A call that never returned is not an unparseable reply, and saying so sent
+// readers looking for malformed output that did not exist. The -v trace made it
+// obvious: "reply began: (empty)".
+func TestAFailedCallIsNotReportedAsUnparseable(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{fn: func(req llm.Request, n int) (llm.Response, error) {
+		if n == 1 {
+			return llm.Response{}, fmt.Errorf("http 503: temporarily unavailable")
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = false
+	in := makeCues(4)
+	res, err := Run(context.Background(), in, o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+
+	if hasWarning(warns, "unparseable") {
+		t.Errorf("a failed call was reported as an unparseable reply: %q", warns)
+	}
+	if !hasWarning(warns, "failed call") {
+		t.Errorf("warnings = %q, want one naming the failed call", warns)
+	}
+}

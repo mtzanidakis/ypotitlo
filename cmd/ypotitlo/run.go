@@ -137,8 +137,13 @@ func exitCode(ctx context.Context, e env, err error) int {
 		return exitOK
 	}
 	// A cancelled context outranks whatever error the cancellation produced.
+	//
+	// It does not say whether anything was written: since a run interrupted
+	// partway saves what it had, the old wording contradicted the "saved ..."
+	// line printed moments earlier and told the user their work was gone when
+	// it was on disk. Whoever wrote the file reports it.
 	if ctx.Err() != nil {
-		outf(e.Stderr, "ypotitlo: cancelled; no output written\n")
+		outf(e.Stderr, "ypotitlo: cancelled\n")
 		return exitCanceled
 	}
 

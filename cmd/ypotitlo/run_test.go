@@ -307,9 +307,9 @@ func TestConfigUnset(t *testing.T) {
 	}
 }
 
-// TestCancelledContextReportsNoOutputWritten pins the promise the tool makes
-// on Ctrl-C: it never leaves a half-translated file behind.
-func TestCancelledContextReportsNoOutputWritten(t *testing.T) {
+// On Ctrl-C the run reports the cancellation and leaves the question of what
+// was written to whoever wrote it.
+func TestCancelledContextReportsTheCancellation(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,8 +319,13 @@ func TestCancelledContextReportsNoOutputWritten(t *testing.T) {
 	if got := exitCode(ctx, e, context.Canceled); got != exitCanceled {
 		t.Errorf("exit = %d, want %d", got, exitCanceled)
 	}
-	if !strings.Contains(errb.String(), "no output written") {
-		t.Errorf("stderr = %q", errb)
+	if !strings.Contains(errb.String(), "cancelled") {
+		t.Errorf("stderr = %q, want it to report the cancellation", errb)
+	}
+	// It must not claim anything about the output: an interrupted run saves what
+	// it had, and this message runs after that has already been reported.
+	if strings.Contains(errb.String(), "no output written") {
+		t.Errorf("stderr = %q; the cancellation message must not contradict a save", errb)
 	}
 }
 

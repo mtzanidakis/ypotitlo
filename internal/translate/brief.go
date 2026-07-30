@@ -42,17 +42,28 @@ const minBriefCues = 12
 // 0 into the most expensive call of the run.
 // briefCharBudget bounds the dialogue sent to pass 0.
 //
-// It is far smaller than a film's script on purpose, and the reason is
-// measurable: pass 0's cost is dominated by reasoning over the dialogue, not by
-// the shape of the reply. On a 734-cue episode against deepseek-v4-flash,
-// trimming the requested fields cut the generated content by two thirds but the
-// reasoning by only a sixth — 14.3k tokens of it remained, on 7.8k tokens of
-// input. The input is the lever.
+// An earlier version of this comment claimed the cost was dominated by reasoning
+// over the input, and that the input was therefore the lever to pull. That was
+// wrong, and it was wrong because it rested on one measurement per variant.
+// Repeated 26 times against deepseek-v4-flash, the per-request spread turned out
+// to be threefold — 52 s to 162 s for an identical prompt — which is larger than
+// every difference the single runs appeared to show.
 //
-// The brief needs enough dialogue to place the cast, the register between them
-// and the recurring terms. It does not need every line, and beyond a point more
-// text buys nothing but latency on the one call that gates the whole run.
-const briefCharBudget = 16_000
+// What the repeats established: wall time is completion tokens over a roughly
+// constant throughput, and reasoning tokens do not grow with input size across
+// the measured range. Sending the whole 26.7k-char file averaged 106 s and 13.9k
+// reasoning tokens, which is *faster* than a 13.8k-char sample of it, and it
+// identified 10.8 of 12 cast members against that sample's 3.6.
+//
+// So the budget is generous. Caveat worth keeping: inputs beyond ~27k chars were
+// not measured, so a three-hour film is extrapolation. The brief is optional and
+// its failure is a warning, which is what makes that an acceptable bet.
+const briefCharBudget = 64_000
+
+// briefWindows is how many contiguous stretches of dialogue are sampled when a
+// file exceeds the budget. A handful of long windows keeps exchanges intact
+// while still spanning the film; see briefSource.
+const briefWindows = 4
 
 // Brief is the pass-0 analysis of the whole file.
 type Brief struct {
@@ -275,19 +286,34 @@ func briefSource(cues []srt.Cue) (text string, sampled bool) {
 		return strings.Join(lines, "\n") + "\n", false
 	}
 
-	// Over budget: take an even spread rather than a prefix. Truncating the head
-	// reads only the opening of the film, which is exactly where the cast is
-	// least established — a character introduced in the second half would be
-	// missing from the brief, and every batch covering them would then be
-	// translated without their name or their register.
-	stride := (total + briefCharBudget - 1) / briefCharBudget
+	// Over budget: take a few long contiguous windows spread across the file.
+	//
+	// Neither obvious approach works. A prefix reads only the opening, where the
+	// cast is least established. But taking every Nth cue — which this did
+	// briefly — is far worse: it destroys the two-speaker exchange structure and
+	// drops the replies in which names are actually spoken, which is the exact
+	// information the brief exists to extract. Measured against
+	// deepseek-v4-flash on a 734-cue episode, an evenly strided sample of half
+	// the file identified 3.6 of 12 cast members where a contiguous prefix of the
+	// same size got 9.5, and one strided run invented a surname that would then
+	// have been injected into every batch as canonical.
+	//
+	// Contiguous windows keep the exchanges intact and still span the film.
+	per := briefCharBudget / briefWindows
 	var sb strings.Builder
-	for i := 0; i < len(lines); i += stride {
-		if sb.Len()+len(lines[i])+1 > briefCharBudget {
-			break
+	for w := range briefWindows {
+		// Start each window at an even offset through the cue list.
+		start := w * len(lines) / briefWindows
+		for i := start; i < len(lines); i++ {
+			if len(sb.String())-w*per >= per {
+				break
+			}
+			if sb.Len()+len(lines[i])+1 > briefCharBudget {
+				break
+			}
+			sb.WriteString(lines[i])
+			sb.WriteByte('\n')
 		}
-		sb.WriteString(lines[i])
-		sb.WriteByte('\n')
 	}
 	return sb.String(), true
 }

@@ -284,18 +284,22 @@ func TestTargetAddendumFallsBackToTheBaseLanguage(t *testing.T) {
 	}
 }
 
-// TestBriefSourceSamplesAcrossTheWholeFile pins the difference between sampling
-// and truncating. A prefix reads only the opening, which is where the cast is
-// least established: a character introduced late would be absent from the brief,
-// and every batch covering them translated without their name or register.
-func TestBriefSourceSamplesAcrossTheWholeFile(t *testing.T) {
+// TestBriefSourceKeepsExchangesContiguous pins the sampling shape.
+//
+// A brief version of this code took every Nth cue, which spans the file but
+// shreds it: the `- A. - B.` two-speaker exchanges are broken apart and the
+// replies where names are spoken are dropped, which is the exact information the
+// brief exists to extract. Measured, that sample found 3.6 of 12 cast members
+// where a same-size contiguous prefix found 9.5. So the sample must be made of
+// contiguous runs, and must still reach the end of the file.
+func TestBriefSourceKeepsExchangesContiguous(t *testing.T) {
 	t.Parallel()
 
-	// Enough cues to blow the budget several times over.
-	line := strings.Repeat("x", 200)
-	cues := make([]srt.Cue, 400)
+	// Numbered cues, well over budget, so the shape of the sample is visible.
+	filler := strings.Repeat("x", 300)
+	cues := make([]srt.Cue, 1200)
 	for i := range cues {
-		cues[i] = cue(fmt.Sprint(i+1), 0, 1000, fmt.Sprintf("%04d %s", i, line))
+		cues[i] = cue(fmt.Sprint(i+1), 0, 1000, fmt.Sprintf("%05d %s", i, filler))
 	}
 
 	got, sampled := briefSource(cues)
@@ -306,19 +310,33 @@ func TestBriefSourceSamplesAcrossTheWholeFile(t *testing.T) {
 		t.Errorf("sample is %d chars, over the %d budget", len(got), briefCharBudget)
 	}
 
-	// The sample must reach the end of the file, not stop early.
-	first := strings.SplitN(got, "\n", 2)[0]
-	if !strings.HasPrefix(first, "0000") {
-		t.Errorf("sample does not start at the beginning: %q", first[:min(12, len(first))])
+	idx := make([]int, 0, 256)
+	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		var n int
+		if _, err := fmt.Sscanf(line, "%05d", &n); err != nil {
+			t.Fatalf("unexpected line %q", line[:min(16, len(line))])
+		}
+		idx = append(idx, n)
 	}
-	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
-	last := lines[len(lines)-1]
-	var idx int
-	if _, err := fmt.Sscanf(last, "%04d", &idx); err != nil {
-		t.Fatalf("unexpected last line %q", last[:min(12, len(last))])
+	if len(idx) < 8 {
+		t.Fatalf("only %d lines sampled", len(idx))
 	}
-	if idx < len(cues)*3/4 {
-		t.Errorf("sample stops at cue %d of %d; it must span the file", idx, len(cues))
+
+	// Most consecutive pairs must be adjacent cues; a strided sample would have
+	// almost none.
+	adjacent := 0
+	for i := 1; i < len(idx); i++ {
+		if idx[i] == idx[i-1]+1 {
+			adjacent++
+		}
+	}
+	if ratio := float64(adjacent) / float64(len(idx)-1); ratio < 0.8 {
+		t.Errorf("only %.0f%% of the sample is contiguous; it must be made of runs, not single lines", ratio*100)
+	}
+
+	// And it must still span the file rather than stopping at the opening.
+	if idx[len(idx)-1] < len(cues)/2 {
+		t.Errorf("sample ends at cue %d of %d; it must reach across the file", idx[len(idx)-1], len(cues))
 	}
 }
 

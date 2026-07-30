@@ -48,17 +48,17 @@ const (
 	// watchdogPoll is how often the stall watchdog looks at the clock.
 	watchdogPoll = 2 * time.Second
 
-	// briefTimeout bounds pass 0, generously, and stays under
-	// defaultStallTimeout so a slow brief is abandoned on its own terms rather
-	// than starving the translation of its stall budget.
+	// briefTimeout bounds pass 0, and is sized from a distribution rather than a
+	// single sample. Over 26 runs against deepseek-v4-flash the call's p90 was
+	// 156 s and its worst 162 s, so two calls at p90 is 312 s — which the earlier
+	// 240 s did not fit at all, and is why it kept firing. CompleteJSON makes
+	// that second call when the JSON needs repairing; empirically it parsed first
+	// try in all 26 runs, so the room for it is insurance rather than the common
+	// path.
 	//
-	// Measured on a 734-cue episode against deepseek-v4-flash: the brief takes
-	// about 65 seconds and spends 10k completion tokens, nine tenths of them
-	// thinking. An earlier 90-second limit therefore fitted the happy path and
-	// nothing else — CompleteJSON makes a second call when the JSON needs
-	// repairing, which alone doubles it, and the client may retry a 5xx on top.
-	// The room here is for the whole sequence, not one call.
-	briefTimeout = 4 * time.Minute
+	// It has to stay under defaultStallTimeout: the watchdog's clock starts
+	// before pass 0, so a brief outlasting the stall budget kills the whole run.
+	briefTimeout = 5*time.Minute + 30*time.Second
 
 	// defaultStallTimeout is how long a run may go without a single batch
 	// completing. Comfortably above the slowest observed batch on a reasoning

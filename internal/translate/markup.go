@@ -318,3 +318,80 @@ func bestCut(words []string, n int) int {
 	}
 	return best
 }
+
+// stripTags removes recognised markup from s, leaving the words.
+func stripTags(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '<' {
+			// scanTag reports the index of the closing '>', so the loop's own
+			// increment is what steps past it.
+			if _, end, ok := scanTag(s, i); ok {
+				i = end
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// reconcileTags salvages a translation whose markup does not match its source.
+//
+// Rejecting the whole cue was the original behaviour and it is the wrong trade:
+// a viewer reading an English line because the model emitted one italic pair too
+// many has lost far more than one reading it in Greek without the italics. The
+// text is what was asked for; the markup is decoration.
+//
+// So the words are kept and the markup is rebuilt from the source. When every
+// source line is wrapped in one tag pair — which is what subtitle italics almost
+// always are — the same wrapping is put back. Anything more intricate is left
+// plain, because guessing where a tag belongs inside a reordered sentence is how
+// markup ends up in the middle of a word.
+func reconcileTags(src, dst []string) (out []string, wrapped bool) {
+	out = make([]string, len(dst))
+	for i, line := range dst {
+		out[i] = stripTags(line)
+	}
+	open, close, ok := commonWrap(src)
+	if !ok {
+		return out, false
+	}
+	for i, line := range out {
+		if line != "" {
+			out[i] = open + line + close
+		}
+	}
+	return out, true
+}
+
+// commonWrap reports the single tag pair enclosing every non-empty source line,
+// if there is one.
+func commonWrap(src []string) (open, close string, ok bool) {
+	for _, line := range src {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		o, end, good := scanTag(line, 0)
+		if !good || strings.HasPrefix(o, "/") {
+			return "", "", false
+		}
+		closing := "</" + o + ">"
+		if !strings.HasSuffix(line, closing) {
+			return "", "", false
+		}
+		// The wrapping must be the only markup on the line.
+		inner := line[end+1 : len(line)-len(closing)]
+		if strings.Contains(inner, "<") {
+			return "", "", false
+		}
+		got := line[:end+1]
+		if open == "" {
+			open, close = got, closing
+		} else if open != got {
+			return "", "", false
+		}
+	}
+	return open, close, open != ""
+}

@@ -1018,10 +1018,18 @@ func (r *runner) apply(job batchJob, prep []*prepared, got map[int]entry) {
 		}
 
 		if !sameTags(p.src, text) {
-			r.warn("batch %d: cue %d lost or invented markup (%s vs %s); keeping the original",
-				job.id, p.idx+1, tagList(p.src), tagList(text))
-			r.fallback([]*prepared{p})
-			continue
+			// The words are what was asked for; the markup is decoration.
+			// Discarding the whole cue over a stray italic pair handed the viewer
+			// an English line, which loses far more than a Greek line without the
+			// italics does.
+			reconciled, wrapped := reconcileTags(p.src, text)
+			note := "kept the translation without it"
+			if wrapped {
+				note = "restored it from the source"
+			}
+			r.warn("batch %d: cue %d came back with different markup (%s vs %s); %s",
+				job.id, p.idx+1, tagList(p.src), tagList(text), note)
+			text = reconciled
 		}
 
 		out := make([]string, len(p.parts))

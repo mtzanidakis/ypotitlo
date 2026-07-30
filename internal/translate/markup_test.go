@@ -73,19 +73,20 @@ func TestRunHTMLMarkup(t *testing.T) {
 			transform: func(s string) string { return strings.ReplaceAll(s, "Hello", "Γεια") },
 			wantLine:  "<i>Γεια</i> there",
 		},
+		// A markup mismatch keeps the words. Handing the viewer the untranslated
+		// line because a tag went astray loses far more than handing them the
+		// translation without its italics.
 		{
-			name:         "dropped tag falls back",
-			transform:    func(s string) string { return strings.NewReplacer("<i>", "", "</i>", "").Replace(s) },
-			wantLine:     "<i>Hello</i> there",
-			untranslated: 1,
-			warning:      "lost or invented markup",
+			name:      "a dropped tag costs the markup, not the translation",
+			transform: func(s string) string { return strings.NewReplacer("<i>", "", "</i>", "").Replace(s) },
+			wantLine:  "Hello there",
+			warning:   "different markup",
 		},
 		{
-			name:         "invented tag falls back",
-			transform:    func(s string) string { return s + "<b>!</b>" },
-			wantLine:     "<i>Hello</i> there",
-			untranslated: 1,
-			warning:      "lost or invented markup",
+			name:      "an invented tag is stripped back off",
+			transform: func(s string) string { return s + "<b>!</b>" },
+			wantLine:  "Hello there!",
+			warning:   "different markup",
 		},
 	}
 
@@ -389,5 +390,112 @@ func TestRestoreSpeakerDash(t *testing.T) {
 				t.Errorf("restoreSpeakerDash(%q, %q) = %q, want %q", tt.src, tt.translated, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStripTags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ in, want string }{
+		{"<i>Hello</i>", "Hello"},
+		{"Hello <b>there</b>, friend", "Hello there, friend"},
+		{`<font color="#ff0000">Red</font>`, "Red"},
+		{"no markup at all", "no markup at all"},
+		// A bare angle bracket is dialogue, not a tag, and must survive.
+		{"if x < 10 > 3", "if x < 10 > 3"},
+		{"<i>only</i> <i>two</i>", "only two"},
+	}
+	for _, tt := range tests {
+		if got := stripTags(tt.in); got != tt.want {
+			t.Errorf("stripTags(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestCommonWrap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		src  []string
+		open string
+		ok   bool
+	}{
+		{"whole line italic", []string{"<i>Hello there.</i>"}, "<i>", true},
+		{"both lines italic", []string{"<i>One</i>", "<i>Two</i>"}, "<i>", true},
+		{"blank lines ignored", []string{"<i>One</i>", ""}, "<i>", true},
+		{"no markup", []string{"Hello"}, "", false},
+		{"partial markup", []string{"Hello <i>there</i>"}, "", false},
+		{"mixed tags", []string{"<i>One</i>", "<b>Two</b>"}, "", false},
+		{"nested", []string{"<i><b>One</b></i>"}, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			open, _, ok := commonWrap(tt.src)
+			if ok != tt.ok || open != tt.open {
+				t.Errorf("commonWrap(%q) = %q,%v, want %q,%v", tt.src, open, ok, tt.open, tt.ok)
+			}
+		})
+	}
+}
+
+// A translation whose markup does not match keeps its words. Handing the viewer
+// an English line because the model emitted one italic pair too many loses far
+// more than handing them a Greek line without the italics.
+func TestReconcileTagsKeepsTheWords(t *testing.T) {
+	t.Parallel()
+
+	t.Run("whole-line wrap is restored", func(t *testing.T) {
+		t.Parallel()
+		src := []string{"<i>Where are you going?</i>"}
+		dst := []string{"<i>Πού <i>πηγαίνεις</i>;</i>"} // an extra pair invented
+		got, wrapped := reconcileTags(src, dst)
+		if !wrapped {
+			t.Error("a whole-line wrap should have been restored")
+		}
+		if got[0] != "<i>Πού πηγαίνεις;</i>" {
+			t.Errorf("got %q", got[0])
+		}
+	})
+
+	t.Run("intricate markup is left plain", func(t *testing.T) {
+		t.Parallel()
+		src := []string{"Hello <i>there</i>, friend"}
+		dst := []string{"Γεια <i>σου</i>, <i>φίλε</i>"}
+		got, wrapped := reconcileTags(src, dst)
+		if wrapped {
+			t.Error("markup that is not a simple wrap must not be guessed at")
+		}
+		if got[0] != "Γεια σου, φίλε" {
+			t.Errorf("got %q, want the words without markup", got[0])
+		}
+	})
+}
+
+// A whole-line italic — the common case in subtitles — is put back when the
+// model mangles it, so emphasis is not lost along with the mismatch.
+func TestWholeLineItalicIsRestored(t *testing.T) {
+	t.Parallel()
+
+	in := []srt.Cue{cue("1", 0, 2000, "<i>Where are you going?</i>")}
+	p := echoing(func(s string) string {
+		// Translated, but with the italics doubled up.
+		return "<i>Πού <i>πηγαίνεις</i>;</i>"
+	})
+
+	var warns []string
+	res, err := Run(context.Background(), in, opts(p, &warns))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := res.Cues[0].Lines[0]; got != "<i>Πού πηγαίνεις;</i>" {
+		t.Errorf("line = %q, want the translation with one clean italic pair", got)
+	}
+	if res.Stats.Untranslated != 0 {
+		t.Errorf("untranslated = %d; a markup mismatch must not cost the translation", res.Stats.Untranslated)
+	}
+	if !hasWarning(warns, "restored it from the source") {
+		t.Errorf("warnings = %q", warns)
 	}
 }

@@ -44,6 +44,13 @@ const (
 	// a third level would be diagnosing a broken model rather than a long reply.
 	maxSplitDepth = 2
 
+	// truncationScale is how much the output ceiling is raised when a reply
+	// comes back cut off. It is deliberately a large step rather than a
+	// doubling: the shortfall is usually a reasoning model's thinking budget,
+	// which is a fixed cost per call, so an incremental increase would just buy
+	// another truncated reply at a higher price.
+	truncationScale = 4
+
 	// reasoningEffort is set low because half of the models this tool can reach
 	// are reasoning models, and a reasoning model asked to translate twenty
 	// subtitle lines will happily spend its entire output budget deliberating
@@ -468,12 +475,27 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 	got := make(map[int]entry, len(prep))
 	skipped := 0
 
-	resp, err := r.call(ctx, r.request(job, prep, prep, "", false))
+	resp, err := r.call(ctx, r.request(job, prep, prep, "", false, 1))
+
+	// A cut-off reply gets a higher ceiling before it gets a smaller batch.
+	//
+	// Halving is the right remedy only when the *content* did not fit. On a
+	// reasoning model the thinking is billed as completion tokens and is spent
+	// before any reply is emitted, and its size tracks the task rather than the
+	// number of cues — so halving leaves the overhead untouched. Splitting
+	// first produced exactly that: a batch going 20 -> 10 -> 5 cues and
+	// truncating at every size, burning calls to reach the same place.
+	if !isFatal(err) && truncated(resp, err) {
+		r.warn("batch %d: the reply was cut off at the token ceiling; retrying with a higher one", job.id)
+		r.bump(func(s *Stats) { s.Retries++ })
+		resp, err = r.call(ctx, r.request(job, prep, prep, "", false, truncationScale))
+	}
+
 	switch {
 	case isFatal(err):
 		return err
 	case truncated(resp, err):
-		return r.splitGroup(ctx, job, prep, depth, "the reply hit the output-token limit")
+		return r.splitGroup(ctx, job, prep, depth, "the reply hit the output-token limit even at a raised ceiling")
 	case err != nil:
 		r.warn("batch %d: call failed: %v", job.id, err)
 	default:
@@ -497,7 +519,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		}
 		r.bump(func(s *Stats) { s.Retries++ })
 
-		resp2, err2 := r.call(ctx, r.request(job, prep, prep, note, true))
+		resp2, err2 := r.call(ctx, r.request(job, prep, prep, note, true, truncationScale))
 		switch {
 		case isFatal(err2):
 			return err2
@@ -518,7 +540,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		r.bump(func(s *Stats) { s.Retries++ })
 
 		note := fmt.Sprintf("Your previous reply omitted %d of the cues. Return ONLY the cue ids listed below, one JSON object per line.", len(missing))
-		resp3, err3 := r.call(ctx, r.request(job, prep, missing, note, true))
+		resp3, err3 := r.call(ctx, r.request(job, prep, missing, note, true, 1))
 		switch {
 		case isFatal(err3):
 			return err3
@@ -535,7 +557,7 @@ func (r *runner) translateGroup(ctx context.Context, job batchJob, prep []*prepa
 		r.bump(func(s *Stats) { s.Refusals += len(refused); s.Retries++ })
 		r.warn("batch %d: %d cue(s) refused; retrying them once", job.id, len(refused))
 
-		resp4, err4 := r.call(ctx, r.request(job, prep, refused, refusalNudge, true))
+		resp4, err4 := r.call(ctx, r.request(job, prep, refused, refusalNudge, true, 1))
 		switch {
 		case isFatal(err4):
 			return err4

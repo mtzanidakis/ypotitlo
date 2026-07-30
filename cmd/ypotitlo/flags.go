@@ -75,6 +75,21 @@ func parseFlagsN(fs *flag.FlagSet, args []string, want int, stdinOK ...string) e
 	return err
 }
 
+// wasGiven reports whether the flag appeared on the command line.
+//
+// This is the only way to tell "-bom=false" from an absent -bom: reading the
+// value cannot, and a flag whose zero value silently beats the config file
+// would override a stored setting on every single run.
+func wasGiven(fs *flag.FlagSet, name string) bool {
+	seen := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			seen = true
+		}
+	})
+	return seen
+}
+
 // usageBlock renders a hand-written help text. The stdlib's generated help
 // sorts alphabetically, which puts -i and -il adjacent and near-identical, and
 // it cannot mark a flag required or show an example.

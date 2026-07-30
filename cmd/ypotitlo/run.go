@@ -69,6 +69,23 @@ func usagef(format string, a ...any) error {
 	return &usageError{fmt.Errorf(format, a...)}
 }
 
+// codedError carries an explicit exit code, so that a shell loop over a
+// subtitle library can distinguish a rejected key from an odd input file
+// without scraping stderr.
+type codedError struct {
+	code int
+	err  error
+}
+
+func (e *codedError) Error() string { return e.err.Error() }
+func (e *codedError) Unwrap() error { return e.err }
+
+// parseError marks a malformed input file, as opposed to a runtime failure.
+type parseError struct{ err error }
+
+func (e *parseError) Error() string { return e.err.Error() }
+func (e *parseError) Unwrap() error { return e.err }
+
 type command struct {
 	run  func(ctx context.Context, e env, args []string) error
 	desc string
@@ -76,6 +93,7 @@ type command struct {
 
 func commands() map[string]command {
 	return map[string]command{
+		"translate":    {cmdTranslate, "Translate a subtitle file into another language"},
 		"list-models":  {cmdListModels, "List the models the endpoint offers"},
 		"config-show":  {cmdConfigShow, "Show the effective config and where each value came from"},
 		"config-set":   {cmdConfigSet, "Set a configuration value"},
@@ -128,6 +146,14 @@ func exitCode(ctx context.Context, e env, err error) int {
 	var ue *usageError
 	if errors.As(err, &ue) {
 		return exitUsage
+	}
+	var pe *parseError
+	if errors.As(err, &pe) {
+		return exitParse
+	}
+	var ce *codedError
+	if errors.As(err, &ce) {
+		return ce.code
 	}
 	return exitError
 }

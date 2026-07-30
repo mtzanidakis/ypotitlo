@@ -220,7 +220,6 @@ DIALOGUE:
 	req := llm.Request{
 		Stage:           "brief",
 		Model:           r.o.Model,
-		MaxTokens:       2048,
 		Temperature:     ptr(0.2),
 		ReasoningEffort: reasoningEffort,
 		Schema:          briefSchema,

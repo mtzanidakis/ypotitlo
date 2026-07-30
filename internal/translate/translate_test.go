@@ -363,9 +363,15 @@ func TestRunFormatViolationRetriesOnceAtTemperatureZero(t *testing.T) {
 	}
 }
 
-// finish_reason=length splits immediately. Retrying the same batch at the same
-// size is guaranteed to truncate again, so it must not happen.
-func TestRunTruncationSplitsWithoutRetrying(t *testing.T) {
+// A truncated reply raises the ceiling before it shrinks the batch.
+//
+// This is not a preference, it is the difference between a run that finishes
+// and one that does not. On a reasoning model the thinking is billed against
+// max_tokens and its size tracks the task, not the number of cues, so halving
+// the batch leaves the overhead exactly where it was. A real run against
+// deepseek-v4-pro did precisely that: batches went 20 -> 10 -> 5 cues,
+// truncated at every size, and burned the call fuse without producing a file.
+func TestRunTruncationRaisesTheCeilingBeforeSplitting(t *testing.T) {
 	t.Parallel()
 
 	in := makeCues(6)
@@ -383,31 +389,69 @@ func TestRunTruncationSplitsWithoutRetrying(t *testing.T) {
 	}
 	assertShape(t, in, res.Cues)
 
-	if res.Stats.Splits != 1 {
-		t.Errorf("splits = %d, want 1", res.Stats.Splits)
+	if res.Stats.Splits != 0 {
+		t.Errorf("splits = %d, want 0: raising the ceiling should have been enough", res.Stats.Splits)
 	}
-	if res.Stats.Retries != 0 {
-		t.Errorf("retries = %d, want 0: a truncated batch must not be retried at the same size", res.Stats.Retries)
+	if res.Stats.Calls != 2 {
+		t.Errorf("calls = %d, want 2 (one truncated, one at a higher ceiling)", res.Stats.Calls)
 	}
-	if res.Stats.Calls != 3 {
-		t.Errorf("calls = %d, want 3 (one truncated plus two halves)", res.Stats.Calls)
-	}
+
 	reqs := p.requests()
-	if got := len(wantedIDs(reqs[1])) + len(wantedIDs(reqs[2])); got != 6 {
-		t.Errorf("the two halves covered %d cues, want 6", got)
+	if len(reqs) < 2 {
+		t.Fatalf("requests = %d, want at least 2", len(reqs))
+	}
+	if reqs[1].MaxTokens <= reqs[0].MaxTokens {
+		t.Errorf("retry ceiling = %d, not above the first call's %d", reqs[1].MaxTokens, reqs[0].MaxTokens)
+	}
+	if got := len(wantedIDs(reqs[1])); got != 6 {
+		t.Errorf("the retry asked for %d cues, want all 6: the batch must not have been split", got)
 	}
 	for i, c := range res.Cues {
 		if want := fmt.Sprintf("EL:line %d", i+1); c.Lines[0] != want {
 			t.Errorf("cue %d: %q, want %q", i, c.Lines[0], want)
 		}
 	}
+	if !hasWarning(warns, "higher one") {
+		t.Errorf("warnings = %q", warns)
+	}
+}
+
+// When even the raised ceiling truncates, the batch is finally halved.
+func TestRunSplitsWhenARaisedCeilingStillTruncates(t *testing.T) {
+	t.Parallel()
+
+	in := makeCues(6)
+	p := &fakeProvider{fn: func(req llm.Request, n int) (llm.Response, error) {
+		// Both the first call and the raised-ceiling retry come back cut off;
+		// only the halves succeed.
+		if n <= 2 {
+			return llm.Response{FinishReason: llm.FinishLength}, nil
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+
+	var warns []string
+	res, err := Run(context.Background(), in, opts(p, &warns))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertShape(t, in, res.Cues)
+
+	if res.Stats.Splits != 1 {
+		t.Errorf("splits = %d, want 1", res.Stats.Splits)
+	}
+	reqs := p.requests()
+	if got := len(wantedIDs(reqs[2])) + len(wantedIDs(reqs[3])); got != 6 {
+		t.Errorf("the two halves covered %d cues, want 6", got)
+	}
 	if !hasWarning(warns, "splitting") {
 		t.Errorf("warnings = %q", warns)
 	}
 }
 
-// The truncated reply may also arrive as an error with no content at all.
-func TestRunTruncationErrorSplits(t *testing.T) {
+// The truncated reply may also arrive as an error with no content at all, and
+// must be recognised as a token-ceiling problem rather than a failed call.
+func TestRunTruncationErrorIsRecognised(t *testing.T) {
 	t.Parallel()
 
 	in := makeCues(4)
@@ -424,8 +468,13 @@ func TestRunTruncationErrorSplits(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	assertShape(t, in, res.Cues)
-	if res.Stats.Splits != 1 || res.Stats.Calls != 3 {
-		t.Errorf("stats = %+v", res.Stats)
+
+	if res.Stats.Calls != 2 {
+		t.Errorf("calls = %d, want 2 (one truncated, one at a higher ceiling)", res.Stats.Calls)
+	}
+	reqs := p.requests()
+	if reqs[1].MaxTokens <= reqs[0].MaxTokens {
+		t.Errorf("retry ceiling = %d, not above the first call's %d", reqs[1].MaxTokens, reqs[0].MaxTokens)
 	}
 }
 
@@ -456,7 +505,11 @@ func TestRunSplitDepthIsCapped(t *testing.T) {
 			t.Errorf("cue %d: %q, want the original %q", i, c.Lines[0], want)
 		}
 	}
-	if res.Stats.Calls > 12 {
+	// Each level now spends one extra call raising the ceiling before it gives
+	// up and halves, so the ceiling is higher than it was — but it is still a
+	// small constant, which is the property under test: a wedged batch must not
+	// cascade into an unbounded number of calls.
+	if res.Stats.Calls > 20 {
 		t.Errorf("calls = %d; a capped split must not cascade", res.Stats.Calls)
 	}
 	if !hasWarning(warns, "cannot be split further") {
@@ -716,16 +769,51 @@ func TestRequestSampling(t *testing.T) {
 	}
 }
 
-func TestMaxTokensGrowsWithSourceSize(t *testing.T) {
+// TestCeilingLeavesRoomToThink pins the constant that wedged a real run.
+//
+// A reasoning model bills its thinking against max_tokens and spends it before
+// emitting anything: measured against deepseek-v4-pro, "hi" with a ceiling of
+// 50 returned finish_reason=length and an empty message, and a 20-cue batch
+// spends on the order of ten thousand tokens thinking. Because that cost is per
+// call rather than per cue, a ceiling sized from the source text truncates
+// every batch however small, and halving does not rescue it.
+func TestCeilingLeavesRoomToThink(t *testing.T) {
 	t.Parallel()
 
-	small := maxTokensFor([]*prepared{{src: []string{"Hi."}}})
-	big := maxTokensFor([]*prepared{{src: []string{strings.Repeat("a longer line of dialogue ", 200)}}})
-	if small >= big {
-		t.Errorf("max tokens did not grow with the source: %d vs %d", small, big)
+	// Even a one-cue batch, whose content needs almost nothing, must carry
+	// enough room for the thinking that precedes it.
+	tiny := maxTokensFor([]*prepared{{src: []string{"Hi."}}}, 1)
+	if tiny < reasoningHeadroom {
+		t.Errorf("ceiling for a one-cue batch = %d, below the reasoning headroom %d", tiny, reasoningHeadroom)
+	}
+}
+
+func TestCeilingGrowsWithSourceSizeAndIsCapped(t *testing.T) {
+	t.Parallel()
+
+	small := maxTokensFor([]*prepared{{src: []string{"Hi."}}}, 1)
+	big := maxTokensFor([]*prepared{{src: []string{strings.Repeat("a longer line of dialogue ", 500)}}}, 1)
+	if small > big {
+		t.Errorf("ceiling shrank as the source grew: %d vs %d", small, big)
 	}
 	if big > maxBatchTokens {
-		t.Errorf("max tokens = %d, above the cap %d", big, maxBatchTokens)
+		t.Errorf("ceiling = %d, above the cap %d: a runaway reasoner must stay bounded", big, maxBatchTokens)
+	}
+}
+
+// A retry after a truncation does send one, because the model's own default has
+// just proven insufficient.
+func TestRetryCeilingIsExplicitAndLarge(t *testing.T) {
+	t.Parallel()
+
+	prep := []*prepared{{src: []string{"Some dialogue to translate."}}}
+	raised := maxTokensFor(prep, truncationScale)
+
+	if raised < minBatchTokens {
+		t.Errorf("retry ceiling = %d, below the floor %d", raised, minBatchTokens)
+	}
+	if raised > maxBatchTokens {
+		t.Errorf("retry ceiling = %d, above the cap %d", raised, maxBatchTokens)
 	}
 }
 

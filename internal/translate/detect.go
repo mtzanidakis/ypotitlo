@@ -147,7 +147,6 @@ func askModel(ctx context.Context, sample string, o Options) (lang.Lang, string,
 	req := llm.Request{
 		Stage:           "detect",
 		Model:           o.Model,
-		MaxTokens:       64,
 		Temperature:     ptr(0.0),
 		ReasoningEffort: reasoningEffort,
 		Schema: &llm.JSONSchema{

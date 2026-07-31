@@ -2,10 +2,13 @@
 
 A command-line toolbox for subtitle files.
 
-Whatever `ypotitlo` is not asked to change comes back exactly as it was: every
-timing, every cue boundary, every piece of markup. It translates an SRT with an
-LLM, talking to [OpenCode Zen](https://opencode.ai/docs/zen/), an
-OpenAI-compatible endpoint, and it pulls subtitle tracks out of video files.
+`ypotitlo` reads an SRT file, translates the dialogue with an LLM, and writes a
+new SRT with every timing, cue boundary and piece of markup exactly where it
+was. It also pulls subtitle tracks out of video files, so a subtitle buried in
+an `.mkv` needs no other tool to get at it.
+
+Translation talks to [OpenCode Zen](https://opencode.ai/docs/zen/), an
+OpenAI-compatible endpoint.
 
 ```
 ypotitlo extract -i movie.mkv

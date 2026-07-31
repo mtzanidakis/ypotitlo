@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# Translate every subtitle in the current directory that has not been
+# translated yet: each *.en.srt whose matching *.el.srt is missing.
+#
+# Anything already translated is left alone, so the script is safe to re-run
+# after an interruption.
+
+set -uo pipefail
+
+prog=${0##*/}
+dry=0
+src=en
+dst=el
+
+usage() {
+	cat <<EOF
+Usage: $prog [-n] [-s LANG] [-l LANG] [-- FLAG...]
+
+Runs 'ypotitlo translate' over every *.$src.srt in the current directory whose
+*.$dst.srt does not exist yet, one file after another.
+
+  -n        list what would run; translate nothing
+  -s LANG   input language suffix to look for (default: $src)
+  -l LANG   target language, and the output suffix (default: $dst)
+  -h        this help
+
+Everything after -- is passed to 'ypotitlo translate' unchanged:
+
+  $prog -- -m deepseek-v4-flash -v
+EOF
+}
+
+while getopts ':ns:l:h' opt; do
+	case $opt in
+	n) dry=1 ;;
+	s) src=$OPTARG ;;
+	l) dst=$OPTARG ;;
+	h)
+		usage
+		exit 0
+		;;
+	:)
+		printf '%s: -%s needs a value\n' "$prog" "$OPTARG" >&2
+		exit 2
+		;;
+	*)
+		printf '%s: unknown flag -%s\n' "$prog" "$OPTARG" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+# getopts stops at --, and this shift drops it, so "$@" is the passthrough.
+shift $((OPTIND - 1))
+
+if ! command -v ypotitlo >/dev/null 2>&1; then
+	printf '%s: ypotitlo is not on PATH\n' "$prog" >&2
+	exit 1
+fi
+
+shopt -s nullglob
+
+todo=()
+done_already=0
+for f in *."$src".srt; do
+	if [[ -e ${f%."$src".srt}.$dst.srt ]]; then
+		done_already=$((done_already + 1))
+		continue
+	fi
+	todo+=("$f")
+done
+
+if ((${#todo[@]} == 0)); then
+	if ((done_already > 0)); then
+		printf '%s: nothing to do; all %d *.%s.srt already have a .%s.srt\n' \
+			"$prog" "$done_already" "$src" "$dst"
+	else
+		printf '%s: no *.%s.srt here\n' "$prog" "$src"
+	fi
+	exit 0
+fi
+
+printf '%s: %d to translate' "$prog" "${#todo[@]}"
+((done_already > 0)) && printf ', %d already done' "$done_already"
+printf '\n'
+
+failed=()
+n=0
+for f in "${todo[@]}"; do
+	n=$((n + 1))
+	printf '\n=== [%d/%d] %s\n' "$n" "${#todo[@]}" "$f"
+
+	if ((dry)); then
+		printf 'ypotitlo translate -i %q -ol %q' "$f" "$dst"
+		(($# > 0)) && printf ' %q' "$@"
+		printf '\n'
+		continue
+	fi
+
+	ypotitlo translate -i "$f" -ol "$dst" "$@"
+	code=$?
+	case $code in
+	0) ;;
+	130)
+		# Ctrl-C means stop the batch, not skip to the next file. ypotitlo has
+		# already saved what it managed and printed the resume command.
+		printf '\n%s: interrupted at %s; %d of %d not started\n' \
+			"$prog" "$f" "$((${#todo[@]} - n))" "${#todo[@]}" >&2
+		exit 130
+		;;
+	4 | 5)
+		# A rejected key or a spent budget will fail for every remaining file
+		# too, so there is nothing to gain by working through the rest.
+		printf '\n%s: stopping; %s exited %d and the rest would fail the same way\n' \
+			"$prog" "$f" "$code" >&2
+		exit "$code"
+		;;
+	*)
+		failed+=("$f")
+		;;
+	esac
+done
+
+if ((${#failed[@]} > 0)); then
+	# A failed run still writes the cues it managed, so the output now exists
+	# and a plain re-run of this script would skip it as done. Resuming is the
+	# only way to finish those, and it has to be asked for by name.
+	printf '\n%s: %d of %d failed; finish them with:\n' \
+		"$prog" "${#failed[@]}" "${#todo[@]}" >&2
+	for f in "${failed[@]}"; do
+		printf '  ypotitlo translate -i %q -ol %q -resume\n' "$f" "$dst" >&2
+	done
+	exit 1
+fi
+
+((dry)) || printf '\n%s: %d translated\n' "$prog" "${#todo[@]}"

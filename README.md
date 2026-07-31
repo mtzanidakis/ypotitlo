@@ -51,6 +51,27 @@ ypotitlo translate -i movie.en.srt -ol el -n
 ypotitlo translate -i movie.en.srt -ol greek
 ```
 
+## While it runs
+
+A translation is minutes of work, so it says what it is doing. Each phase keeps
+its line once it finishes, with the time it took:
+
+```
+input encoding: utf-8
+✓ detecting language · 0:00
+translating English (filename) -> Greek
+✓ brief · 1:18
+⠹ translating 384/734 · 21:07 · eta 19:24
+```
+
+The estimate appears once five per cent of the cues are done, and is withdrawn
+rather than pinned at zero if the remaining batches outlast it. A phase that
+finished after a warning is marked `!` instead of `✓`, so the tick never
+contradicts something printed above it.
+
+Add `-v` for the reply behind a warning. Both markup mismatches and both
+misreported failures fixed before this release were found that way.
+
 ## Commands
 
 | Command | Purpose |
@@ -229,10 +250,12 @@ Zen](#opencode-go-and-opencode-zen) for what `base_url` selects.
 | 3 | The input could not be parsed |
 | 4 | The API key was rejected, or the account is out of credit |
 | 5 | The spend ceiling was reached |
-| 130 | Interrupted; nothing was written |
+| 130 | Interrupted; whatever was translated is saved |
 
-Output is written atomically, so an interrupted or failed run leaves the
-previous file intact rather than a half-translated one.
+Output is written atomically: the file that appears is whole, never a
+half-written one. That is separate from *how much* of it is translated — an
+interrupted or failed run deliberately keeps the cues it managed, so the work is
+there to resume rather than thrown away.
 
 ## Development
 

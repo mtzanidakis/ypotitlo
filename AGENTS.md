@@ -33,6 +33,12 @@ obvious library joins words across adjacent tags, escapes ampersands
 asymmetrically and trims leading whitespace. None of those failures produces an
 error; they produce a slightly wrong file.
 
+It is also why `internal/mkv` reads Matroska itself instead of shelling out to
+`ffmpeg`. The same argument applies one layer down — a subtitle that passes
+through a general-purpose media tool comes out slightly different — with the
+added cost that an external binary is a dependency the user has to have, at a
+version we cannot pin.
+
 Concretely:
 
 - A cue is `{Index, Start, End, Lines}` where `Lines` is **opaque**. The parser
@@ -99,6 +105,26 @@ belongs at the divergence site as a comment. The current set:
 - **ffmpeg's SRT reader** drops a cue's trailing numeric text line, discards
   empty cues and re-sorts by timestamp. We keep all three, because cue count and
   order are part of the contract.
+- **ffmpeg's subtitle stream copy** out of an .mkv writes LF between the cues
+  and whatever the block held inside them, which for most muxers is CRLF. The
+  result is a mixed-ending file. `extract` detects the container's own
+  convention and writes the whole file with it; see `cueLineEnding`.
+- **Matroska's "eng" default** for an untagged track is reported as a guess
+  (`Track.LanguageIsDefault`) rather than as the language, because it lands in a
+  filename and is wrong on a great many rips.
+- **`FlagDefault` defaults to 1**, unlike `FlagForced` and
+  `FlagHearingImpaired`, so a muxer writes the element only on the tracks that
+  are *not* default. `readTrackEntry` therefore starts it true. Initialising it
+  false reads every track in every file as non-default and nothing fails —
+  `testdata/tracks.mkv` exists because a hand-built fixture cannot catch that.
+- **`-forced` and `-sdh` read the track's title** as well as its flag.
+  `FlagHearingImpaired` postdates most files in circulation, which record the
+  fact only in the title. The inference is reported, because it decides the
+  output filename. Title words are matched whole: a substring match finds "hi"
+  in "This" and "cc" in "Occitan".
+- **Laced subtitle blocks** are refused, not split. No muxer emits them and the
+  splitting code could not be tested against anything real; an error that names
+  the problem beats untested code that silently mistimes a file.
 - **ffmpeg's millisecond parsing** reads `,5` as 5ms. We read it as 500ms: the
   separator is a decimal point, and `,5` in the wild means half a second.
 - **`golang.org/x/net/html/charset`** is not used. It hunts for `<meta>` tags

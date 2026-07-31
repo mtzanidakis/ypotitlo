@@ -170,11 +170,7 @@ func runTranslate(ctx context.Context, e env, f translateFlags) error {
 	}
 	// Resuming reads the previous output and writes it back, so the guard that
 	// refuses an existing file would refuse the whole point of it.
-	guard := f
-	if f.resume {
-		guard.force = true
-	}
-	if err := guardOutput(guard, outPath); err != nil {
+	if err := guardOutput(f.in, outPath, f.force || f.resume); err != nil {
 		return err
 	}
 
@@ -381,7 +377,7 @@ func resolveOutputPath(f translateFlags, target lang.Lang) (string, error) {
 // guardOutput is the last line of defence against destroying the input. The
 // derivation rule can legitimately produce the input's own name -- translating
 // movie.el.srt into Greek is the obvious case -- and -o can be pointed anywhere.
-func guardOutput(f translateFlags, outPath string) error {
+func guardOutput(in, outPath string, force bool) error {
 	// Writing to stdout can clobber nothing.
 	if outPath == stdinPath {
 		return nil
@@ -389,8 +385,8 @@ func guardOutput(f translateFlags, outPath string) error {
 	// The same-file check needs two real paths. Reading stdin skips only that
 	// check — it must not also disable the clobber check below, which is what an
 	// earlier combined guard did: "-i - -o existing.srt" overwrote silently.
-	if f.in != stdinPath {
-		same, err := lang.SameFile(f.in, outPath)
+	if in != stdinPath {
+		same, err := lang.SameFile(in, outPath)
 		if err != nil {
 			return err
 		}
@@ -398,7 +394,7 @@ func guardOutput(f translateFlags, outPath string) error {
 			return usagef("the output path %q is the input file; pass -o to write somewhere else", outPath)
 		}
 	}
-	if _, err := os.Stat(outPath); err == nil && !f.force {
+	if _, err := os.Stat(outPath); err == nil && !force {
 		return usagef("%q already exists; pass -f to overwrite", outPath)
 	}
 	// Finding out the directory is unwritable after the model calls are paid for
@@ -557,6 +553,15 @@ func writeOutput(e env, file *srt.File, f translateFlags, outPath string) error 
 		}
 	}
 
+	return writeFileAtomic(e, outPath, body)
+}
+
+// writeFileAtomic puts body at outPath, or on stdout when outPath is "-".
+//
+// The file goes down as a temporary in the same directory and is then renamed,
+// so a crash or a signal leaves either the old file or the new one and never a
+// half-written one.
+func writeFileAtomic(e env, outPath string, body []byte) error {
 	if outPath == stdinPath {
 		_, err := e.Stdout.Write(body)
 		return err

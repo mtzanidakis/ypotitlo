@@ -401,7 +401,7 @@ func TestStdinInputStillRefusesToClobber(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := guardOutput(translateFlags{in: stdinPath, out: out}, out)
+	err := guardOutput(stdinPath, out, false)
 	if err == nil {
 		t.Fatal("guardOutput allowed an existing file to be overwritten from stdin")
 	}
@@ -410,7 +410,7 @@ func TestStdinInputStillRefusesToClobber(t *testing.T) {
 	}
 
 	// -f still permits it.
-	if err := guardOutput(translateFlags{in: stdinPath, out: out, force: true}, out); err != nil {
+	if err := guardOutput(stdinPath, out, true); err != nil {
 		t.Errorf("-f should permit the overwrite: %v", err)
 	}
 }
@@ -419,7 +419,7 @@ func TestStdinInputStillRefusesToClobber(t *testing.T) {
 func TestStdoutOutputIsNeverGuarded(t *testing.T) {
 	t.Parallel()
 
-	if err := guardOutput(translateFlags{in: stdinPath, out: stdinPath}, stdinPath); err != nil {
+	if err := guardOutput(stdinPath, stdinPath, false); err != nil {
 		t.Errorf("writing to stdout was refused: %v", err)
 	}
 }
@@ -438,7 +438,7 @@ func TestUnwritableOutputDirIsCaughtEarly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := guardOutput(translateFlags{in: in}, filepath.Join(dir, "movie.el.srt"))
+	err := guardOutput(in, filepath.Join(dir, "movie.el.srt"), false)
 	if err == nil {
 		t.Skip("running as a user who can write to a 0500 directory")
 	}

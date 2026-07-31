@@ -1,12 +1,16 @@
 # Built binary
 /ypotitlo
 
-# Test / scratch subtitle files. Unit-test fixtures under testdata/ are tracked
-# deliberately — the whole test strategy is golden round-trip files.
+# Test / scratch subtitle files, and the containers they get extracted from.
+# Unit-test fixtures under testdata/ are tracked deliberately — the whole test
+# strategy is golden round-trip files.
 *.srt
 *.vtt
 *.ass
 *.ssa
+*.mkv
+*.mka
+*.webm
 !**/testdata/**
 
 # Test & lint artifacts

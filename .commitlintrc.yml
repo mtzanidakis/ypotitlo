@@ -21,6 +21,7 @@ rules:
     - 2
     - always
     - - srt
+      - mkv
       - charset
       - lang
       - config

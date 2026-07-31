@@ -303,3 +303,106 @@ func TestFromFilenameAgreesWithDerivation(t *testing.T) {
 		}
 	}
 }
+
+func TestSidecarPath(t *testing.T) {
+	t.Parallel()
+
+	english, err := Resolve("eng")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		in      string
+		lang    Lang
+		markers []string
+		want    string
+	}{
+		{name: "mkv", in: "movie.mkv", lang: english, want: "movie.en.srt"},
+		{name: "webm", in: "clip.webm", lang: english, want: "clip.en.srt"},
+		{name: "uppercase extension", in: "movie.MKV", lang: english, want: "movie.en.srt"},
+		{name: "directory is kept verbatim", in: "./films/movie.mkv", lang: english, want: "./films/movie.en.srt"},
+		{name: "absolute path", in: "/srv/media/movie.mkv", lang: english, want: "/srv/media/movie.en.srt"},
+		// Only container extensions are stripped. A dotted release name
+		// is part of the stem, and removing ".2160p" would be inventing a
+		// filename the user did not have.
+		{name: "dotted release name", in: "Movie.Title.1991.2160p.mkv", lang: english, want: "Movie.Title.1991.2160p.en.srt"},
+		{name: "unknown extension is part of the stem", in: "movie.avi", lang: english, want: "movie.avi.en.srt"},
+		{name: "no extension", in: "movie", lang: english, want: "movie.en.srt"},
+		// The forced and the full track of one language would otherwise
+		// derive the same name and one would overwrite the other.
+		{name: "forced", in: "movie.mkv", lang: english, markers: []string{"forced"}, want: "movie.en.forced.srt"},
+		{name: "sdh", in: "movie.mkv", lang: english, markers: []string{"sdh"}, want: "movie.en.sdh.srt"},
+		{name: "both markers", in: "movie.mkv", lang: english, markers: []string{"forced", "sdh"}, want: "movie.en.forced.sdh.srt"},
+		// An untagged track has no code to put in the name. Asserting one
+		// would be worse than leaving it out.
+		{name: "unknown language", in: "movie.mkv", lang: Lang{}, want: "movie.srt"},
+		{name: "unknown language with a marker", in: "movie.mkv", lang: Lang{}, markers: []string{"forced"}, want: "movie.forced.srt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := SidecarPath(tt.in, tt.lang, tt.markers...)
+			if err != nil {
+				t.Fatalf("SidecarPath(%q): %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("SidecarPath(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSidecarPathRejects(t *testing.T) {
+	t.Parallel()
+
+	english, err := Resolve("eng")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	for _, in := range []string{"", "-", "films/"} {
+		if got, err := SidecarPath(in, english); err == nil {
+			t.Errorf("SidecarPath(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+// A sidecar name is the input to translate, so the two derivations have to
+// agree: movie.en.forced.srt must become movie.el.forced.srt, with "forced" left
+// where it is rather than read as the language.
+func TestSidecarPathFeedsDeriveOutputPath(t *testing.T) {
+	t.Parallel()
+
+	english, err := Resolve("eng")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	greek, err := Resolve("el")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	tests := []struct {
+		markers []string
+		want    string
+	}{
+		{nil, "movie.el.srt"},
+		{[]string{"forced"}, "movie.el.forced.srt"},
+		{[]string{"sdh"}, "movie.el.sdh.srt"},
+	}
+	for _, tt := range tests {
+		sidecar, err := SidecarPath("movie.mkv", english, tt.markers...)
+		if err != nil {
+			t.Fatalf("SidecarPath: %v", err)
+		}
+		got, err := DeriveOutputPath(sidecar, greek)
+		if err != nil {
+			t.Fatalf("DeriveOutputPath(%q): %v", sidecar, err)
+		}
+		if got != tt.want {
+			t.Errorf("%q -> %q, want %q", sidecar, got, tt.want)
+		}
+	}
+}

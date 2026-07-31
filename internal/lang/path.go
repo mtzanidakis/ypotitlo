@@ -57,6 +57,60 @@ var subtitleExts = map[string]bool{
 // defaultExt is used when the input has no recognisable subtitle extension.
 const defaultExt = ".srt"
 
+// containerExts are the media containers a subtitle track can be extracted
+// from. They are a separate table from subtitleExts because they play the
+// opposite role: a container extension is always stripped and replaced, never
+// preserved, since what comes out of an .mkv is a .srt.
+var containerExts = map[string]bool{
+	".mkv":  true,
+	".mk3d": true,
+	".mka":  true,
+	".webm": true,
+}
+
+// SidecarPath computes where a subtitle extracted from a media container
+// should be written: movie.mkv with an English track becomes movie.en.srt.
+//
+// markers are track descriptors — "forced", "sdh" — appended after the
+// language code, in the same vocabulary [DeriveOutputPath] peels off. Two
+// tracks of the same language would otherwise derive the same filename and one
+// would overwrite the other, and putting them in this order is what lets a
+// later translation of movie.en.sdh.srt produce movie.el.sdh.srt rather than
+// treating "sdh" as the language.
+//
+// An empty target language is not an error: an untagged track has no code to
+// put in the name, and movie.srt is a more honest filename than one asserting a
+// language nobody knows.
+func SidecarPath(container string, l Lang, markers ...string) (string, error) {
+	if container == "" {
+		return "", fmt.Errorf("derive subtitle path: empty container path")
+	}
+	if container == "-" {
+		return "", fmt.Errorf("derive subtitle path: cannot derive a path from stdin; pass -o")
+	}
+
+	dir, base := filepath.Split(container)
+	if base == "" {
+		return "", fmt.Errorf("derive subtitle path: %q is a directory", container)
+	}
+
+	stem := base
+	if ext := filepath.Ext(base); containerExts[strings.ToLower(ext)] {
+		stem = base[:len(base)-len(ext)]
+	}
+	if stem == "" {
+		return "", fmt.Errorf("derive subtitle path: %q has no filename before the extension", container)
+	}
+
+	segs := []string{stem}
+	if !l.Zero() {
+		segs = append(segs, l.Code)
+	}
+	segs = append(segs, markers...)
+
+	return dir + strings.Join(segs, ".") + defaultExt, nil
+}
+
 // DeriveOutputPath computes the path to write the translation of in to, by
 // replacing the language segment of the filename with target's canonical
 // code — movie.en.srt with -ol greek becomes movie.el.srt.

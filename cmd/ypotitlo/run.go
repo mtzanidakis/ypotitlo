@@ -94,6 +94,7 @@ type command struct {
 func commands() map[string]command {
 	return map[string]command{
 		"translate":    {cmdTranslate, "Translate a subtitle file into another language"},
+		"extract":      {cmdExtract, "Extract an embedded subtitle track from a video file"},
 		"list-models":  {cmdListModels, "List the models the endpoint offers"},
 		"config-show":  {cmdConfigShow, "Show the effective config and where each value came from"},
 		"config-set":   {cmdConfigSet, "Set a configuration value"},
@@ -105,7 +106,7 @@ func commands() map[string]command {
 
 // order is the order subcommands are listed in the usage text; it is
 // deliberately by workflow rather than alphabetical.
-var order = []string{"translate", "list-models", "config-show", "config-set", "config-unset", "upgrade", "version"}
+var order = []string{"translate", "extract", "list-models", "config-show", "config-set", "config-unset", "upgrade", "version"}
 
 func run(ctx context.Context, e env) int {
 	if len(e.Args) == 0 {

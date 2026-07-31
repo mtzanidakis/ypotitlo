@@ -51,6 +51,10 @@ ypotitlo translate -i movie.en.srt -ol el -n
 ypotitlo translate -i movie.en.srt -ol greek
 ```
 
+If the subtitle is inside a video file rather than beside it, `ypotitlo extract
+-i movie.mkv` writes it out first — see [Extracting from a video
+file](#extracting-from-a-video-file).
+
 ## While it runs
 
 A translation is minutes of work, so it says what it is doing. Each phase keeps
@@ -77,6 +81,7 @@ misreported failures fixed before this release were found that way.
 | Command | Purpose |
 | --- | --- |
 | `translate` | Translate a subtitle file |
+| `extract` | Extract an embedded subtitle track from a video file |
 | `list-models` | List the models the endpoint offers, with prices |
 | `config-show` | Show the effective config and where each value came from |
 | `config-set` | Set a configuration value |
@@ -85,6 +90,97 @@ misreported failures fixed before this release were found that way.
 | `version` | Print the version |
 
 Run `ypotitlo <command> -h` for a command's flags.
+
+## Extracting from a video file
+
+Most films arrive with their subtitles inside the container rather than beside
+it. `extract` pulls one out as an SRT, which is then an ordinary input to
+`translate`:
+
+```sh
+# See what is in there. This reads only the header, so it is instant even
+# on a 50 GB file.
+ypotitlo extract -i movie.mkv -list
+
+# Pull the track out. With one text track there is nothing to choose.
+ypotitlo extract -i movie.mkv        # -> movie.en.srt
+
+# Otherwise say which language you want, spelled however you like.
+ypotitlo extract -i movie.mkv -il el
+
+# Then translate it as usual.
+ypotitlo translate -i movie.en.srt -ol greek
+```
+
+```
+TRACK  LANGUAGE  CODEC        FLAGS    NAME
+2      en        SubRip text  default  English
+3      en        SubRip text  forced   Signs
+4      en        SubRip text  sdh?     English SDH
+5      el        SubRip text  -        Greek
+6      el        PGS bitmap   -        -
+
+A ? means the flag is not set and the track's name is what says so.
+```
+
+Tracks are selected by language, not by number: `-il` takes the same spellings
+as `translate`, so `-il el`, `-il ell`, `-il gre` and `-il greek` are one
+request. `-il` can be left out when the file has only one text track, or when
+every track is in the same language.
+
+Everything after the language is decided rather than asked. A forced track is
+signs and captions only — thirty cues where the full track has fifteen hundred
+— so it never wins; hearing-impaired loses to the plain track; then the file's
+own default flag decides, and the track number settles the rest, which is what
+makes the same file always yield the same subtitle. Whenever there was a choice
+to make, `extract` says which track it took and which it left:
+
+```
+warning: 3 tracks match; extracting track 2 (eng, default, "English") and leaving
+track 3 (eng, forced, "Signs"), track 4 (eng, sdh?, "English SDH")
+```
+
+`-forced` and `-sdh` ask for the tracks that automatic choice deliberately
+skips:
+
+```sh
+ypotitlo extract -i movie.mkv -il en -sdh      # -> movie.en.sdh.srt
+ypotitlo extract -i movie.mkv -il en -forced   # -> movie.en.forced.srt
+```
+
+They are filters, not preferences: asking for a track the file does not have is
+refused, rather than quietly satisfied with the nearest other one. Both also
+read the track's *title*, because `FlagHearingImpaired` was added to Matroska
+long after the files most people own were muxed and a great many rips record
+the fact only there. When a marker comes from the title rather than the flag,
+`extract` says so — it decides the output filename, and an unflagged SDH track
+would otherwise overwrite the ordinary one.
+
+The output name carries the track's flags, so the forced and the full track of
+one language cannot overwrite each other:
+
+| Track | Output |
+| --- | --- |
+| English | `movie.en.srt` |
+| English, forced | `movie.en.forced.srt` |
+| English, hearing-impaired | `movie.en.sdh.srt` |
+| No language tag at all | `movie.en.srt`, and it says the language was assumed |
+
+Matroska says an untagged track is English. That default is wrong often enough
+that `extract` reports it as a guess rather than presenting it as a fact.
+
+Only text tracks (`S_TEXT/UTF8`) can become an SRT. ASS and SSA carry styling
+that would have to be thrown away, and PGS, VobSub and DVB subtitles are images
+rather than text; all of them are named and refused rather than silently
+flattened into something lossy. `mkvextract` handles ASS, and a bitmap track
+needs OCR.
+
+There is no `ffmpeg` to install: `ypotitlo` reads the container itself. That is
+deliberate. A stream copy through `ffmpeg` produces a file with LF between the
+cues and CRLF inside them, because it copies the block text verbatim while
+writing its own structure — a mixed-ending file that every later tool then has
+to make a decision about. `extract` takes the container's own convention and
+uses it throughout, or writes what `-crlf` says.
 
 ## Languages
 

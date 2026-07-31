@@ -3,6 +3,11 @@
 # Translate every subtitle in the current directory that has not been
 # translated yet: each *.en.srt whose matching *.el.srt is missing.
 #
+# Track markers are part of the pairing, because they are part of the name
+# ypotitlo writes: movie.en.sdh.srt is looked for as movie.el.sdh.srt, not as
+# movie.el.srt. Matching on the plain suffix alone would miss every extracted
+# forced and SDH track, which is most of what comes out of a container.
+#
 # Anything already translated is left alone, so the script is safe to re-run
 # after an interruption.
 
@@ -18,11 +23,12 @@ usage() {
 Usage: $prog [-n] [-s LANG] [-l LANG] [-- FLAG...]
 
 Runs 'ypotitlo translate' over every *.$src.srt in the current directory whose
-*.$dst.srt does not exist yet, one file after another.
+*.$dst.srt does not exist yet, one file after another. Track markers count as
+part of the name, so movie.$src.sdh.srt is paired with movie.$dst.sdh.srt.
 
   -n        list what would run; translate nothing
-  -s LANG   input language suffix to look for (default: $src)
-  -l LANG   target language, and the output suffix (default: $dst)
+  -s LANG   input language segment to look for (default: $src)
+  -l LANG   target language, and the output segment (default: $dst)
   -h        this help
 
 Everything after -- is passed to 'ypotitlo translate' unchanged:
@@ -60,11 +66,45 @@ if ! command -v ypotitlo >/dev/null 2>&1; then
 fi
 
 shopt -s nullglob
+# Filename segments are compared without regard to case, the way ypotitlo
+# compares them. Set after the option loop so getopts keeps its own case.
+shopt -s nocasematch
+
+# Segments that name the *kind* of track rather than its language. The list
+# mirrors markerSet in internal/lang/path.go, which is what decides the name
+# ypotitlo actually writes. If the two ever disagree, this script waits for an
+# output file that will never appear and pays to translate the same subtitle
+# again on every run.
+markers='forced|sdh|hi|cc|hoh|hearing|impaired|full|sub|subs|srt|ass|ssa|vtt|default|native|dub|dubbed'
+
+# translated_name prints the file ypotitlo would write for $1, and fails when
+# $1 is not a subtitle in $src.
+#
+# Markers are peeled off the end before the language segment is read, for the
+# same reason ypotitlo peels them: "sdh" and "hi" are themselves well-formed
+# language codes, so movie.en.sdh.srt read from the right alone looks like a
+# Southern Kurdish subtitle rather than an English one.
+translated_name() {
+	local stem=${1%.srt} seg suffix=''
+
+	while [[ $stem == *.* ]]; do
+		seg=${stem##*.}
+		[[ $seg =~ ^($markers)$ ]] || break
+		suffix=.$seg$suffix
+		stem=${stem%.*}
+	done
+
+	[[ $stem == *.* ]] || return 1
+	[[ ${stem##*.} == "$src" ]] || return 1
+
+	printf '%s.%s%s.srt\n' "${stem%.*}" "$dst" "$suffix"
+}
 
 todo=()
 done_already=0
-for f in *."$src".srt; do
-	if [[ -e ${f%."$src".srt}.$dst.srt ]]; then
+for f in *.srt; do
+	out=$(translated_name "$f") || continue
+	if [[ -e $out ]]; then
 		done_already=$((done_already + 1))
 		continue
 	fi
@@ -73,10 +113,10 @@ done
 
 if ((${#todo[@]} == 0)); then
 	if ((done_already > 0)); then
-		printf '%s: nothing to do; all %d *.%s.srt already have a .%s.srt\n' \
+		printf '%s: nothing to do; all %d %s subtitles are already translated to %s\n' \
 			"$prog" "$done_already" "$src" "$dst"
 	else
-		printf '%s: no *.%s.srt here\n' "$prog" "$src"
+		printf '%s: no %s subtitles here\n' "$prog" "$src"
 	fi
 	exit 0
 fi

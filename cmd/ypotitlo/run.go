@@ -167,7 +167,7 @@ func exitCode(ctx context.Context, e env, err error) int {
 
 func printUsage(w io.Writer) {
 	var b strings.Builder
-	b.WriteString("ypotitlo translates subtitle files into another language via an LLM.\n\n")
+	b.WriteString("ypotitlo is a command-line toolbox for subtitle files.\n\n")
 	b.WriteString("Usage:\n  ypotitlo <command> [flags]\n\nCommands:\n")
 
 	cmds := commands()

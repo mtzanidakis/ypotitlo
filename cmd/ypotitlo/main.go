@@ -1,4 +1,4 @@
-// Command ypotitlo translates subtitle files into another language via an LLM.
+// Command ypotitlo is a command-line toolbox for subtitle files.
 //
 // Subcommands are dispatched from os.Args[1] (no cobra). The stdlib flag
 // package is used deliberately: it looks flag names up by exact match, so

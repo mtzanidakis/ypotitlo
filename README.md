@@ -1,12 +1,16 @@
 # ypotitlo
 
-Translate subtitle files into another language with an LLM.
+A command-line toolbox for subtitle files.
 
-`ypotitlo` reads an SRT file, translates the dialogue, and writes a new SRT with
-every timing, cue boundary and piece of markup exactly where it was. It talks to
-[OpenCode Zen](https://opencode.ai/docs/zen/), an OpenAI-compatible endpoint.
+Whatever `ypotitlo` is not asked to change comes back exactly as it was: every
+timing, every cue boundary, every piece of markup. It translates an SRT with an
+LLM, talking to [OpenCode Zen](https://opencode.ai/docs/zen/), an
+OpenAI-compatible endpoint, and it pulls subtitle tracks out of video files.
 
 ```
+ypotitlo extract -i movie.mkv
+# -> movie.en.srt
+
 ypotitlo translate -i movie.en.srt -ol greek
 # -> movie.el.srt
 ```

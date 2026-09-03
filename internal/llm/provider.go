@@ -62,6 +62,7 @@ type OpenCodeGoConfig struct {
 	Rand         *rand.Rand
 	Prices       map[string]TokenPrice
 	ExtraHeaders map[string]string
+	SessionID    string // X-Opencode-Session; empty mints one per client
 	BaseURL      string // overridable for tests and for the zen/v1 endpoint
 	OnAttempt    func() // called after every HTTP exchange; see Config.OnAttempt
 }
@@ -81,7 +82,7 @@ func NewOpenCodeGo(cfg OpenCodeGoConfig) *Client {
 	}
 	return NewClient(Config{
 		Name: "opencode-go", BaseURL: base, APIKey: cfg.APIKey, KeySource: cfg.KeySource,
-		ReportsCost: false, TryJSONSchema: false, Prices: prices, ExtraHeaders: cfg.ExtraHeaders,
+		ReportsCost: false, TryJSONSchema: false, Prices: prices, ExtraHeaders: cfg.ExtraHeaders, SessionID: cfg.SessionID,
 		Budget: cfg.Budget, HTTP: cfg.HTTP, Now: cfg.Now, Sleep: cfg.Sleep, OnAttempt: cfg.OnAttempt, Rand: cfg.Rand,
 	})
 }

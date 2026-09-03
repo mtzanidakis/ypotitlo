@@ -687,3 +687,80 @@ func TestCancelledContextStopsRetrying(t *testing.T) {
 		t.Errorf("calls = %d, want 1: a cancelled run must not keep retrying", calls.Load())
 	}
 }
+
+func TestSessionHeaderIsStableAcrossACall(t *testing.T) {
+	t.Parallel()
+	// Zen groups a conversation by this header and warns that requests without
+	// it may start erroring, so the interesting property is not that some value
+	// is sent but that one run sends the same value every time — including the
+	// retry of a failed attempt, which is part of the same conversation.
+	var mu sync.Mutex
+	var seen []string
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("X-Opencode-Session"))
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(chatOK))
+	}))
+	defer srv.Close()
+
+	c := openCodeOn(t, srv.URL)
+	for range 2 {
+		if _, err := c.Complete(context.Background(), userReq("m")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 {
+		t.Fatalf("got %d requests, want 3 (a 429, its retry, and a second call)", len(seen))
+	}
+	for i, s := range seen {
+		if s == "" {
+			t.Fatalf("request %d carried no %s header", i, sessionHeader)
+		}
+		if s != seen[0] {
+			t.Errorf("request %d session = %q, want %q: one run is one conversation", i, s, seen[0])
+		}
+	}
+}
+
+func TestSessionIDIsPerClientAndOverridable(t *testing.T) {
+	t.Parallel()
+	var got atomic.Value
+	got.Store("")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Get("X-Opencode-Session"))
+		_, _ = w.Write([]byte(chatOK))
+	}))
+	defer srv.Close()
+
+	// An explicit id is sent verbatim, so a caller that has its own notion of a
+	// conversation can supply it.
+	c := openCodeOn(t, srv.URL, func(cfg *OpenCodeGoConfig) { cfg.SessionID = "fixed-id" })
+	if _, err := c.Complete(context.Background(), userReq("m")); err != nil {
+		t.Fatal(err)
+	}
+	if got.Load() != "fixed-id" {
+		t.Errorf("session = %q, want fixed-id", got.Load())
+	}
+
+	// Two clients built the same way must not share an id: separate runs are
+	// separate conversations, and the jitter source is seeded identically in
+	// every test, so a minted id must not be derived from it.
+	a, b := openCodeOn(t, srv.URL), openCodeOn(t, srv.URL)
+	if a.sessionID == b.sessionID {
+		t.Errorf("two clients share session id %q", a.sessionID)
+	}
+	if !strings.HasPrefix(a.sessionID, "ypotitlo-") {
+		t.Errorf("session id %q does not name the client that minted it", a.sessionID)
+	}
+}

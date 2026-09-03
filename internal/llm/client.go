@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -64,6 +65,7 @@ type Client struct {
 	tryJSONSchema bool // send response_format=json_schema first (false for OpenCode Zen)
 	prices        map[string]TokenPrice
 	extraHeaders  map[string]string
+	sessionID     string
 	onAttempt     func()
 
 	// rand is guarded: math/rand.Rand is not safe for concurrent use and one
@@ -93,8 +95,15 @@ type Config struct {
 	// limits before sending it. Claiming to be another client on a hunch is
 	// not something to do speculatively.
 	ExtraHeaders map[string]string
-	Budget       *BudgetGuard
-	HTTP         *http.Client
+	// SessionID is sent as X-Opencode-Session on every request. Zen uses it to
+	// group the calls of one conversation, and warns that requests without it
+	// may start being rejected. Empty gets a fresh random id per client, which
+	// is the right granularity: one client is built per run, so every batch and
+	// every repair round-trip of that run shares an id, and separate runs do
+	// not collide.
+	SessionID string
+	Budget    *BudgetGuard
+	HTTP      *http.Client
 	// RequestTimeout bounds one HTTP exchange. 0 means DefaultRequestTimeout.
 	// Ignored when HTTP is supplied.
 	RequestTimeout time.Duration
@@ -185,12 +194,16 @@ func NewClient(cfg Config) *Client {
 	if retriesOther == 0 {
 		retriesOther = defaultRetriesOther
 	}
+	sessionID := cfg.SessionID
+	if sessionID == "" {
+		sessionID = newSessionID()
+	}
 	return &Client{
 		name: cfg.Name, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, keySource: cfg.KeySource,
 		hc: hc, retries429: retries429, retriesOther: retriesOther,
 		budget: cfg.Budget, now: now, sleep: sleep, rand: rnd,
 		reportsCost: cfg.ReportsCost, tryJSONSchema: cfg.TryJSONSchema, prices: cfg.Prices,
-		extraHeaders: cfg.ExtraHeaders, onAttempt: cfg.OnAttempt,
+		extraHeaders: cfg.ExtraHeaders, sessionID: sessionID, onAttempt: cfg.OnAttempt,
 	}
 }
 
@@ -376,6 +389,14 @@ func spend(used *int, limit int) bool {
 	return true
 }
 
+// sessionHeader groups a conversation's requests for the provider.
+const sessionHeader = "X-Opencode-Session"
+
+// newSessionID mints the per-run conversation id. crypto/rand.Text is a
+// 26-character base32 string and never fails; the value only has to be
+// unguessable enough not to collide with another user's run.
+func newSessionID() string { return "ypotitlo-" + crand.Text() }
+
 func (c *Client) newRequest(ctx context.Context, method, path string, raw []byte) (*http.Request, error) {
 	var body io.Reader
 	if raw != nil {
@@ -392,6 +413,10 @@ func (c *Client) newRequest(ctx context.Context, method, path string, raw []byte
 	}
 	if raw != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// Set before ExtraHeaders so an explicitly configured session id still wins.
+	if c.sessionID != "" {
+		req.Header.Set(sessionHeader, c.sessionID)
 	}
 	for k, v := range c.extraHeaders {
 		req.Header.Set(k, v)

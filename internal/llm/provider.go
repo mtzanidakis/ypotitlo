@@ -25,7 +25,10 @@ const DefaultOpenCodeGoBaseURL = "https://opencode.ai/zen/go/v1"
 // other one.
 //
 // Deliberately absent, because the docs publish no price for them:
-// mimo-v2-pro, mimo-v2-omni, mimo-v2.5-pro, mimo-v2.5, hy3, hy3-preview.
+// mimo-v2-pro, mimo-v2-omni, mimo-v2.5-pro, mimo-v2.5, hy3, hy3-preview, and
+// (as of 2026-09-13) deepseek-v4.1-flash and deepseek-flash, which /models
+// lists but the pricing table does not yet mention. Add deepseek-v4.1-flash
+// here the moment the docs price it: it is the model the README recommends.
 // (The table does list a "MiMo-V2.5 Free" as free, but its id is
 // mimo-v2.5-free, a different model from mimo-v2.5.) Leaving them out is the
 // point: estimateCost then reports their cost as *unknown*, which the footer

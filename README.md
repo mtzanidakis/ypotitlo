@@ -42,9 +42,9 @@ working binary in place.
 # the endpoint is reachable.
 ypotitlo list-models
 
-# Pick a model. deepseek-v4-flash translates a feature film for pennies;
+# Pick a model. deepseek-v4.1-flash translates a feature film for pennies;
 # the reasoning models cost roughly ten times as much for the same file.
-ypotitlo config-set model deepseek-v4-flash
+ypotitlo config-set model deepseek-v4.1-flash
 
 # Provide a key, read from stdin so it stays out of your shell history.
 # The same key works for both OpenCode Go and Zen, and is skipped entirely

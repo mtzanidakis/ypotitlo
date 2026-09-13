@@ -33,7 +33,7 @@ part of the name, so movie.$src.sdh.srt is paired with movie.$dst.sdh.srt.
 
 Everything after -- is passed to 'ypotitlo translate' unchanged:
 
-  $prog -- -m deepseek-v4-flash -v
+  $prog -- -m deepseek-v4.1-flash -v
 EOF
 }
 

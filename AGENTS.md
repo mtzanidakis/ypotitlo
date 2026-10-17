@@ -15,7 +15,7 @@ Conventions for working on `ypotitlo`.
 | Verify modules | `mise run verify` |
 | Lint the last commit | `mise run commitlint` |
 
-Go 1.26.5 and golangci-lint 2.12.2, both pinned in `mise.toml`.
+Go 1.27.2 and golangci-lint 2.15.0, both pinned in `mise.toml`.
 
 ## The golden rule
 

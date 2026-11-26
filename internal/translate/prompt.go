@@ -30,6 +30,26 @@ import (
 //     Batches run concurrently and cannot see each other, so the decision is
 //     made once, in the brief, and injected verbatim into every batch.
 //
+//  5. Gender. A subtitle file does not say who is speaking, and a language
+//     that inflects for gender needs to know: "I'm sure" is "σίγουρος" or
+//     "σίγουρη". Left alone the model guesses, usually masculine, and does not
+//     guess the same way twice — one run addressed the same woman as "τυχαίος"
+//     and, twenty cues later, as "τυχαία". The prompt therefore says whose
+//     gender each form follows, and gives the way out when the dialogue does
+//     not settle it: a wording that carries no gender, which is always
+//     available in Greek and is never wrong.
+//
+//     Measured on fifteen lines of a feature film whose speaker the script
+//     itself makes plain, five runs each way against deepseek-v4.1-flash: 16
+//     wrong-gender lines before this rule and the wider context window (see
+//     batch.go), 9 after. The two were not measured separately.
+//
+//     It narrows the problem, it does not close it, and it has a cost worth
+//     knowing. Five of those nine are one scene the text cannot attribute,
+//     where the model now sometimes guesses feminine instead of going
+//     unmarked — and the old masculine default happened to be right there.
+//     Telling a model not to default one way does not make it stop guessing.
+//
 // The hard invariants are repeated at the end of the user message. With a long
 // instruction set, recency wins: what the model read last is what it obeys.
 
@@ -53,6 +73,11 @@ READABILITY — a subtitle is read in under three seconds:
 - Condense. Drop filler ("well", "you know", "I mean"), redundant vocatives and repetitions rather than overflowing the line. A shorter subtitle that says the same thing is a better subtitle.
 - Break lines at a syntactic boundary — after punctuation, before a conjunction, never between an article and its noun or between a preposition and its object.
 - When both are legal, prefer the break that leaves the first line shorter.
+
+WHO IS SPEAKING — a subtitle file carries no speaker labels, so work this out before you translate:
+- Read the context lines and the cues together as one conversation. Names, vocatives, replies and third-person references ("she said", "my husband") tell you who says each line and to whom.
+- Where the target language marks grammatical gender, a first-person form agrees with the speaker and a second-person form with the person addressed. Take each character's gender from the brief.
+- When the dialogue does not settle who is speaking or who is addressed, do not guess and do not fall back on the masculine: choose a wording that leaves the gender unmarked.
 
 REGISTER AND CONSISTENCY:
 - Match the register of the source: slang stays slang, profanity stays profanity at the same strength, formal speech stays formal. Do not sanitise. This is published dialogue from a finished film and it is rendered faithfully or not at all.
@@ -101,6 +126,8 @@ var addenda = map[string]string{
 - Keep the reading rate under 17 characters per second, counting spaces. This is stricter than the line-length rule and it binds first: a two-second cue holds about 34 characters, not 84.
 - When a cue holds two speakers, the second line starts with a dash and no space after it: "-Πού πας;" — not "- Πού πας;".
 - Decide εσύ or εσείς per pair of speakers from the brief and never switch mid-film. Do not default to εσείς because the source uses "you": English has no T–V distinction and copying it produces stilted subtitles.
+- Adjectives, participles and nouns for a person agree with that person's gender: a woman says "είμαι σίγουρη", "ήμουν μόνη μου", "είμαι δασκάλα", and is asked "είσαι έτοιμη;". When you cannot tell who is speaking or addressed, use a form that carries no gender: "Κουράστηκες;" rather than "Είσαι κουρασμένος;", "Σίγουρα;" rather than "Είσαι σίγουρος;", "Χαίρομαι" rather than "Είμαι χαρούμενος".
+- A mixed or unknown group is never "Κύριοι": English "people", "everyone", "guys" address everybody present.
 - Do not transliterate a foreign name that has an established Greek form, and never invent one mid-file: use the rendering the brief gives.`,
 }
 

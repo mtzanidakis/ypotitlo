@@ -118,7 +118,13 @@ func (b *Brief) prompt() string {
 		sb.WriteString("\nCharacters (name → rendering, gender). The gender decides the grammatical gender of what they say about themselves and of what is said to them:")
 		for _, c := range b.Characters {
 			fmt.Fprintf(&sb, "\n  %s → %s", c.Name, orDash(c.Rendered))
-			if c.Gender != "" {
+			switch {
+			case strings.EqualFold(c.Gender, "unknown"):
+				// Spelled out, because a bare "(unknown)" reads as a gap in the
+				// brief and a model fills gaps: it has to be told that not
+				// knowing is the answer, and what to do about it.
+				sb.WriteString(" (gender not established: word what they say and what is said to them so that it carries no gender)")
+			case c.Gender != "":
 				fmt.Fprintf(&sb, " (%s)", c.Gender)
 			}
 		}
@@ -237,10 +243,25 @@ func (r *runner) makeBrief(ctx context.Context, cues []srt.Cue) *Brief {
 		src = r.o.Source.English
 	}
 
+	// The gender instruction exists because pass 0 used to answer with whatever
+	// the name looked like, and a source file does not always spell a name one
+	// way. A film whose subtitles call one man both "Fernando" and "Fernanda"
+	// had him down as female in 7 of 9 entries across eight briefs; with the
+	// instruction it is 2 of 9, and 6 of the rest are "unknown". It cost
+	// nothing elsewhere: the other 87 entries were all correct before and
+	// after, and none of them turned "unknown".
+	//
+	// What it does not do is change the translation, at least not measurably.
+	// Over five runs each way, the lines that man speaks came out feminine in 2
+	// renderings of 10 with a brief that said "female" and in 1 of 10 with one
+	// that said "unknown": a batch goes by the dialogue around a line before it
+	// goes by the brief. This is here so that the brief does not assert what it
+	// does not know, which is what any later change that leans on the brief's
+	// gender will need (see the note on briefSchema).
 	user := fmt.Sprintf(`Below is the complete dialogue of one film, one cue per line.
 
 Analyse it and return JSON describing how it must be translated from %s into %s:
-- characters: the named speakers who actually matter, at most 12, with "rendered" set to the exact spelling of the name in %s and "gender" one of male, female, unknown.
+- characters: the named speakers who actually matter, at most 12, with "rendered" set to the exact spelling of the name in %s and "gender" one of male, female, unknown. Decide the gender from how the dialogue refers to the character (he or she, son or daughter, husband or wife, Mr or Mrs) before the spelling of the name. Answer unknown when those references disagree with each other or with the name, or when the name appears in both a masculine and a feminine form: a wrong gender is repeated in every scene of the translation, an unknown one is not.
 - register: at most 8 pairs of characters who address each other, the second-person form to use in %s (for Greek: "εσύ" or "εσείς"), and a reason of at most eight words. Include a pair only when the dialogue actually shows them speaking to each other.
 - glossary: at most 12 recurring terms, jargon, nicknames, institutions or catchphrases, each with the single rendering to use everywhere.
 - tone: one sentence on the register and style of the film as a whole.

@@ -197,6 +197,68 @@ func TestBriefPrompt(t *testing.T) {
 	}
 }
 
+// An unknown gender is an instruction, not a gap. A bare "(unknown)" invites
+// the model to fill it in, so the brief says what not knowing means for the
+// wording — and says it however the model happened to capitalise the value.
+func TestBriefPromptSpellsOutUnknownGender(t *testing.T) {
+	t.Parallel()
+
+	for _, gender := range []string{"unknown", "Unknown", "UNKNOWN"} {
+		b := &Brief{Characters: []BriefCharacter{
+			{Name: "Sam", Rendered: "Σαμ", Gender: gender},
+			{Name: "Ana", Rendered: "Άνα", Gender: "female"},
+		}}
+		got := b.prompt()
+		if !strings.Contains(got, "Sam → Σαμ (gender not established: word what they say and what is said to them so that it carries no gender)") {
+			t.Errorf("gender %q was not spelled out:\n%s", gender, got)
+		}
+		if strings.Contains(strings.ToLower(got), "(unknown)") {
+			t.Errorf("gender %q was rendered as a bare label:\n%s", gender, got)
+		}
+		// A known gender is still just the word.
+		if !strings.Contains(got, "Ana → Άνα (female)") {
+			t.Errorf("a known gender changed shape:\n%s", got)
+		}
+	}
+}
+
+// Pass 0 is told to weigh how a character is referred to above how the name
+// is spelled, and to answer "unknown" when the two disagree. Without it a name
+// the source spells two ways is given a confident gender, usually the wrong
+// one.
+func TestBriefRequestAsksForUnknownOnConflict(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{fn: func(req llm.Request, _ int) (llm.Response, error) {
+		if req.Stage == "brief" {
+			return llm.Response{Content: briefJSON}, nil
+		}
+		return llm.Response{Content: reply(req, prefix("EL:"))}, nil
+	}}
+	var warns []string
+	o := opts(p, &warns)
+	o.Brief = true
+
+	if _, err := Run(context.Background(), makeCues(30), o); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	reqs := p.requests()
+	if len(reqs) == 0 || reqs[0].Stage != "brief" {
+		t.Fatalf("first call is not the brief: %+v", reqs)
+	}
+	user := userMessage(reqs[0])
+	for _, want := range []string{
+		`"gender" one of male, female, unknown`,
+		"before the spelling of the name",
+		"Answer unknown when those references disagree",
+		"both a masculine and a feminine form",
+	} {
+		if !strings.Contains(user, want) {
+			t.Errorf("brief request is missing %q:\n%s", want, user)
+		}
+	}
+}
+
 func TestBriefSourceTruncates(t *testing.T) {
 	t.Parallel()
 

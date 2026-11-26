@@ -12,17 +12,32 @@ import (
 // the second half of a conversation it cannot see the start of.
 const sceneGap = 2 * time.Second
 
-// contextCues is how many source cues on either side of a batch are shown to
-// the model as read-only context.
+// contextBefore and contextAfter are how many source cues on either side of a
+// batch are shown to the model as read-only context.
 //
 // It has to be *source* cues. Carrying the previous batch's *translation*
 // forward would give better consistency in principle and is what a serial
 // implementation would do, but it serialises the whole run: batch 5 cannot
-// start until batch 4 has come back. Source text is known up front, so ±3
-// source cues costs about 10% more input tokens and stays embarrassingly
-// parallel. Cross-boundary sentences, which is what the context is actually
-// for, are visible either way.
-const contextCues = 3
+// start until batch 4 has come back. Source text is known up front, so the
+// context stays embarrassingly parallel.
+//
+// The window was ±3, which is enough to see a sentence that straddles the
+// boundary and not enough to see who is talking. A subtitle file has no
+// speaker labels, so the gender of a speaker or of the person addressed comes
+// from a name, a vocative or a "she" somewhere earlier in the scene — and the
+// first cues of a batch had three lines to find it in. It is lopsided because
+// that evidence lies overwhelmingly behind a line rather than ahead of it.
+//
+// Measured together with the gender rule in the prompt (see prompt.go), on 775
+// cues of a feature film against deepseek-v4.1-flash, five runs against four of
+// the old window: 20% more prompt tokens and 18% more completion tokens, the
+// latter outside the spread between runs. Format compliance held: in 200
+// batches, three cues came back with the wrong line count and were re-split,
+// and one cue had to be asked for again.
+const (
+	contextBefore = 12
+	contextAfter  = 4
+)
 
 // batchRange is a half-open range of cue indices.
 type batchRange struct{ start, end int }

@@ -232,6 +232,13 @@ func TestSystemPrompt(t *testing.T) {
 		`";"`,
 		"17 characters per second",
 		"εσύ",
+		// Grammatical gender: the rule, and the unmarked fallback that keeps a
+		// line nobody can attribute from being guessed masculine.
+		"WHO IS SPEAKING",
+		"do not fall back on the masculine",
+		"είσαι έτοιμη;",
+		`"Κουράστηκες;" rather than "Είσαι κουρασμένος;"`,
+		`never "Κύριοι"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt is missing %q", want)

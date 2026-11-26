@@ -808,11 +808,14 @@ func TestCeilingIsFlatAndEscalatesOnce(t *testing.T) {
 	}
 }
 
-// Context cues are shown but never requested.
+// Context cues are shown but never requested, and the window is deliberately
+// lopsided: twelve cues before a batch and four after it. The cues before are
+// where a speaker is named or referred to as "he" or "she", which is what a
+// gendered target language needs and what a ±3 window usually missed.
 func TestRequestCarriesSourceContext(t *testing.T) {
 	t.Parallel()
 
-	in := makeCues(12)
+	in := makeCues(40)
 	p := echoing(prefix("EL:"))
 	var warns []string
 	o := opts(p, &warns)
@@ -824,17 +827,26 @@ func TestRequestCarriesSourceContext(t *testing.T) {
 	}
 
 	reqs := p.requests()
-	if len(reqs) != 3 {
-		t.Fatalf("calls = %d, want 3", len(reqs))
+	if len(reqs) != 10 {
+		t.Fatalf("calls = %d, want 10", len(reqs))
 	}
-	mid := userMessage(reqs[1])
+	// The sixth batch is lines 21-24, far enough from both ends of the file
+	// that neither side of the window is cut short.
+	mid := userMessage(reqs[5])
 	if !strings.Contains(mid, "CONTEXT BEFORE") || !strings.Contains(mid, "CONTEXT AFTER") {
 		t.Fatalf("middle batch has no context:\n%s", mid)
 	}
-	if !strings.Contains(mid, "  line 2\n") || !strings.Contains(mid, "  line 11\n") {
-		t.Errorf("context window is not ±3 source cues:\n%s", mid)
+	for _, want := range []string{"  line 9\n", "  line 20\n", "  line 25\n", "  line 28\n"} {
+		if !strings.Contains(mid, want) {
+			t.Errorf("context window is missing %q:\n%s", want, mid)
+		}
 	}
-	if got := len(parseRequest(reqs[1])); got != 4 {
+	for _, not := range []string{"  line 8\n", "  line 29\n"} {
+		if strings.Contains(mid, not) {
+			t.Errorf("context window reaches %q, beyond 12 before and 4 after:\n%s", not, mid)
+		}
+	}
+	if got := len(parseRequest(reqs[5])); got != 4 {
 		t.Errorf("emitted-cue blocks = %d, want 4: context must not be requestable", got)
 	}
 }

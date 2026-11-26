@@ -12,7 +12,7 @@
 // The pipeline is:
 //
 //	pass 0   one call over the whole file for a translation brief (brief.go)
-//	batching scene-aware grouping with ±3 source cues of context (batch.go)
+//	batching scene-aware grouping with source cues of context (batch.go)
 //	batches  JSON Lines request/response, run concurrently (protocol.go)
 //	repair   four failure causes, four distinct responses (see runBatch)
 //
@@ -816,8 +816,8 @@ func (r *runner) runBatch(ctx context.Context, cues []srt.Cue, br batchRange, id
 	}
 	job := batchJob{
 		id:     id,
-		before: contextText(cues, max(0, br.start-contextCues), br.start),
-		after:  contextText(cues, br.end, min(len(cues), br.end+contextCues)),
+		before: contextText(cues, max(0, br.start-contextBefore), br.start),
+		after:  contextText(cues, br.end, min(len(cues), br.end+contextAfter)),
 	}
 	return r.translateGroup(ctx, job, prep, 0, 1)
 }
@@ -991,9 +991,9 @@ func (r *runner) splitGroup(ctx context.Context, job batchJob, prep []*prepared,
 	left, right := prep[:mid], prep[mid:]
 
 	// Each half becomes the other's context, so splitting never costs the
-	// continuity the ±3 window was there to provide.
-	leftJob := batchJob{id: job.id, before: job.before, after: headText(right, contextCues)}
-	rightJob := batchJob{id: job.id, before: tailText(left, contextCues), after: job.after}
+	// continuity the context window was there to provide.
+	leftJob := batchJob{id: job.id, before: job.before, after: headText(right, contextAfter)}
+	rightJob := batchJob{id: job.id, before: tailText(left, contextBefore), after: job.after}
 
 	if err := r.translateGroup(ctx, leftJob, left, depth+1, scale); err != nil {
 		return err

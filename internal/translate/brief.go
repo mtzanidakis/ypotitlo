@@ -115,7 +115,7 @@ func (b *Brief) prompt() string {
 		fmt.Fprintf(&sb, "\nTone: %s", b.Tone)
 	}
 	if len(b.Characters) > 0 {
-		sb.WriteString("\nCharacters (name → rendering, gender):")
+		sb.WriteString("\nCharacters (name → rendering, gender). The gender decides the grammatical gender of what they say about themselves and of what is said to them:")
 		for _, c := range b.Characters {
 			fmt.Fprintf(&sb, "\n  %s → %s", c.Name, orDash(c.Rendered))
 			if c.Gender != "" {
@@ -158,6 +158,19 @@ func orDash(s string) string {
 // call from 65s and 9.2k reasoning tokens to 134s and 17.2k. Free-text "note"
 // fields on characters and glossary terms were the bulk of that and bought
 // nothing the translator needed, so they are gone. Keep this shape lean.
+//
+// A "role" per character ("elderly landlady", "police chief") was tried and
+// left out, and not for its cost, which was nil: pass 0 took 43 s and 48 s with
+// it against 41 s and 62 s without. The idea was that a subtitle file has no
+// speaker labels, so a batch needs something to recognise a speaker by. Over
+// five runs each way on 775 cues it made no difference on the lines whose
+// speaker the script makes plain — four wrong-gender lines with it, four
+// without. What it did change is how firmly a batch follows the brief's
+// gender, and the brief is not reliable enough to be followed that firmly: one
+// character the source names two ways came out female in three briefs of five,
+// and the lines that character speaks then carried the wrong gender in 9 of 10
+// renderings with the role, against 3 of 10 without it. Make the brief's
+// gender trustworthy before making it more persuasive.
 var briefSchema = &llm.JSONSchema{
 	Name: "subtitle_brief",
 	Schema: map[string]any{
